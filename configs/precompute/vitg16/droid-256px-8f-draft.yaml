@@ -1,0 +1,38 @@
+app: vjepa_droid_precompute
+folder: /your_folder/droid/precompute-vitg16-256px-8f
+
+# Draft that mirrors configs/train/vitg16/droid-256px-8f.yaml where applicable.
+meta:
+  dtype: bfloat16
+  seed: 239
+  use_sdpa: true
+
+data:
+  batch_size: 8
+  camera_views: [left_mp4_path]
+  crop_size: 256
+  datasets:
+    - /your_file_path/droid_train_paths.csv
+  dataset_fpcs: [8]
+  fps: 4
+  num_workers: 12
+  patch_size: 16
+  pin_mem: true
+  stereo_view: false
+  tubelet_size: 2
+
+# Precompute-only settings
+precompute:
+  output_dir: /your_file_path/droid_precomputed_tokens
+  shard_size: 4096
+  save_dtype: float16
+  # Only encode once and stop before predictor.
+  encode_only: true
+
+# Optional fast training loader over precomputed shards.
+precomputed_data:
+  shard_glob: /your_file_path/droid_precomputed_tokens/*.pt
+  batch_size: 32
+  num_workers: 8
+  pin_mem: true
+  persistent_workers: true
