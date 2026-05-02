@@ -123,6 +123,22 @@ def precompute_and_write(
         torch.save(shard, out / f"rank{rank}_shard{sid:05d}.pt")
 
 
+def predictor_forward_from_precomputed(
+    predictor: torch.nn.Module,
+    batch: Dict[str, torch.Tensor],
+    tokens_per_frame: int,
+):
+    """How states/actions are fed into predictor for precomputed batches.
+
+    Equivalent to the online-train call pattern:
+      predictor(z[:, :-tokens_per_frame], actions, states[:, :-1], extrinsics[:, :-1])
+    """
+    z_ctx, actions, states_ctx, extrinsics_ctx = prepare_predictor_inputs_from_precomputed(
+        batch, tokens_per_frame=tokens_per_frame
+    )
+    return predictor(z_ctx, actions, states_ctx, extrinsics_ctx)
+
+
 class PrecomputedDROIDDataset(Dataset):
     """Fast map-style loader over precomputed shard files."""
 

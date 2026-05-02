@@ -9,6 +9,8 @@ Yes. The DROID training stack already cleanly separates:
 So we can add a **separate precompute flow** that reuses the same data and model construction,
 and exits after `encoder(clips)` to persist features.
 
+It also includes `predictor_forward_from_precomputed(...)` which applies the
+same 4-argument predictor call as training.
 ## DORID-oriented config interpretation (from `configs/train/vitg16/droid-256px-8f.yaml`)
 These fields should carry over unchanged to precompute because they define the clip distribution:
 - `data.datasets`
