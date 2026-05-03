@@ -39,6 +39,9 @@ def init_data(
     transform=None,
     camera_frame=False,
     tubelet_size=2,
+    state_start_idx=0,
+    state_dim=7,
+    action_dim=7,
 ):
     dataset = BehaviorVideoDataset(
         data_path=data_path,
@@ -47,6 +50,9 @@ def init_data(
         fps=fps,
         frameskip=tubelet_size,
         camera_frame=camera_frame,
+        state_start_idx=state_start_idx,
+        state_dim=state_dim,
+        action_dim=action_dim,
     )
 
     dist_sampler = torch.utils.data.distributed.DistributedSampler(
@@ -79,6 +85,9 @@ class BehaviorVideoDataset(DROIDVideoDataset):
         fps=5,
         transform=None,
         camera_frame=False,
+        state_start_idx=0,
+        state_dim=7,
+        action_dim=7,
     ):
         self.data_path = data_path
         self.dataset_root = os.path.dirname(os.path.abspath(data_path))
@@ -87,6 +96,9 @@ class BehaviorVideoDataset(DROIDVideoDataset):
         self.fps = fps
         self.transform = transform
         self.camera_frame = camera_frame
+        self.state_start_idx = state_start_idx
+        self.state_dim = state_dim
+        self.action_dim = action_dim
 
         if VideoReader is None:
             raise ImportError('Unable to import "decord" which is required to read videos.')
@@ -143,23 +155,19 @@ class BehaviorVideoDataset(DROIDVideoDataset):
         ppath = sample["parquet_path"]
 
         df = pd.read_parquet(ppath)
-        pose_cols = [
-            c
-            for c in [
-                "observation.state.pose.x",
-                "observation.state.pose.y",
-                "observation.state.pose.z",
-                "observation.state.pose.roll",
-                "observation.state.pose.pitch",
-                "observation.state.pose.yaw",
-                "observation.state.gripper",
-            ]
-            if c in df.columns
-        ]
-        if len(pose_cols) < 7:
-            raise ValueError(f"Missing state columns in parquet: {ppath}")
+        if "observation.state" not in df.columns or "action" not in df.columns:
+            raise ValueError(f"Expected `observation.state` and `action` in parquet: {ppath}")
 
-        states = df[pose_cols].to_numpy(dtype=np.float32)
+        full_states = np.asarray(df["observation.state"].to_list(), dtype=np.float32)
+        full_actions = np.asarray(df["action"].to_list(), dtype=np.float32)
+
+        if full_states.shape[1] < self.state_start_idx + self.state_dim:
+            raise ValueError(
+                f"State slice out of bounds for {ppath}: {full_states.shape[1]=}, "
+                f"{self.state_start_idx=}, {self.state_dim=}"
+            )
+
+        states = full_states[:, self.state_start_idx : self.state_start_idx + self.state_dim]
         vr = VideoReader(vpath, num_threads=-1, ctx=cpu(0))
 
         vfps = vr.get_avg_fps()
@@ -169,7 +177,7 @@ class BehaviorVideoDataset(DROIDVideoDataset):
         nframes = int(fpc * fstp)
         vlen = len(vr)
 
-        if vlen < nframes or states.shape[0] < nframes:
+        if vlen < nframes or states.shape[0] < nframes or full_actions.shape[0] < nframes:
             raise Exception(f"Episode too short {vpath=}, {nframes=}, {vlen=}, states={states.shape[0]}")
 
         ef = np.random.randint(nframes, min(vlen, states.shape[0]))
@@ -177,7 +185,7 @@ class BehaviorVideoDataset(DROIDVideoDataset):
         indices = np.arange(sf, sf + nframes, fstp).astype(np.int64)
 
         states = states[indices, :][:: self.frameskip]
-        actions = self.poses_to_diffs(states)
+        actions = full_actions[indices, : self.action_dim][:: self.frameskip]
 
         vr.seek(0)
         buffer = vr.get_batch(indices).asnumpy()
