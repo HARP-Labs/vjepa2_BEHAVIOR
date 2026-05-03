@@ -16,8 +16,6 @@ import torch
 import torch.utils.data
 from decord import VideoReader, cpu
 
-from app.vjepa_droid.droid import DROIDVideoDataset
-
 logger = getLogger()
 
 
@@ -78,8 +76,8 @@ def init_data(
     return data_loader, dist_sampler
 
 
-class BehaviorVideoDataset(DROIDVideoDataset):
-    """BEHAVIOR dataset that reuses DROID preprocessing and action/state generation."""
+class BehaviorVideoDataset(torch.utils.data.Dataset):
+    """BEHAVIOR dataset with deterministic episode-chunk sampling for pre-encoding/training."""
 
     def __init__(
         self,
