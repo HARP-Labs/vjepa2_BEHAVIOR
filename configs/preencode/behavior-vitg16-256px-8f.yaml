@@ -1,0 +1,46 @@
+app: vjepa_droid
+folder: /your_folder/preencode/behavior-vitg16-256px-8f
+
+meta:
+  seed: 239
+  dtype: bfloat16
+  pretrain_checkpoint: /your_vjepa2_checkpoints/vitg.pt
+  context_encoder_key: target_encoder
+  target_encoder_key: target_encoder
+
+input:
+  # CSV with columns:
+  # episode_id,video_path,parquet_path,json_path
+  manifest_path: /your_file_path/behavior_manifest.csv
+
+output:
+  output_root: /your_file_path/preencoded_behavior
+  manifest_out: /your_file_path/preencoded_behavior_manifest.csv
+  overwrite: false
+  save_format: pt
+  token_layout_version: 1
+
+data:
+  frames_per_clip: 8
+  fps: 4
+  crop_size: 256
+  patch_size: 16
+  tubelet_size: 2
+  camera_views:
+    - left_mp4_path
+  stereo_view: false
+  random_clip_sampling: true
+  deterministic_preprocess: true
+  include_extrinsics: false
+  compute_actions_from_states: true
+
+model:
+  model_name: vit_giant_xformers
+  use_sdpa: true
+  use_activation_checkpointing: true
+
+runtime:
+  batch_size: 4
+  num_workers: 12
+  pin_mem: true
+  persistent_workers: true
