@@ -176,21 +176,31 @@ class BehaviorVideoDataset(DROIDVideoDataset):
         vr = VideoReader(vpath, num_threads=-1, ctx=cpu(0))
 
         vfps = vr.get_avg_fps()
-        fpc = self.frames_per_clip
         fps = self.fps if self.fps is not None else vfps
         fstp = ceil(vfps / fps)
-        nframes = int(fpc * fstp)
         vlen = len(vr)
 
-        if vlen < nframes or states.shape[0] < nframes or full_actions.shape[0] < nframes:
-            raise Exception(f"Episode too short {vpath=}, {nframes=}, {vlen=}, states={states.shape[0]}")
+        max_len = min(vlen, states.shape[0], full_actions.shape[0])
+        if max_len < fstp:
+            raise Exception(f"Episode too short for subsampling {vpath=}, {fstp=}, {max_len=}")
 
-        ef = np.random.randint(nframes, min(vlen, states.shape[0]))
-        sf = ef - nframes
-        indices = np.arange(sf, sf + nframes, fstp).astype(np.int64)
+        # Full-episode fixed-fps subsampling for preencode.
+        indices = np.arange(0, max_len, fstp, dtype=np.int64)
+        states = states[indices, :]
 
-        states = states[indices, :][:: self.frameskip]
-        actions = full_actions[indices, : self.action_dim][:: self.frameskip]
+        # Aggregate raw per-step actions between sampled indices.
+        # This preserves motion/action signal across dropped frames.
+        raw_actions = full_actions[:, : self.action_dim]
+        actions = []
+        for i, start in enumerate(indices):
+            end = indices[i + 1] if i + 1 < len(indices) else min(start + fstp, max_len)
+            actions.append(raw_actions[start:end].sum(axis=0))
+        actions = np.asarray(actions, dtype=np.float32)
+
+        if self.frameskip > 1:
+            states = states[:: self.frameskip]
+            actions = actions[:: self.frameskip]
+            indices = indices[:: self.frameskip]
 
         vr.seek(0)
         buffer = vr.get_batch(indices).asnumpy()
