@@ -1,0 +1,24 @@
+app: vjepa_droid
+
+data:
+  # Path to BEHAVIOR manifest.json
+  datasets:
+    - /your_file_path/behavior/manifest.json
+  dataset_fpcs:
+    - 8
+  batch_size: 8
+  fps: 4
+  crop_size: 256
+  patch_size: 16
+  tubelet_size: 2
+  num_workers: 12
+  pin_mem: true
+  stereo_view: false
+  camera_frame: false
+
+  # observation.state is a packed vector; select the training slice here.
+  state_start_idx: 0
+  state_dim: 7
+
+  # action is taken directly from parquet column `action`.
+  action_dim: 23
