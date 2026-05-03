@@ -33,6 +33,7 @@ def init_data(
     num_workers=10,
     pin_mem=True,
     persistent_workers=True,
+    prefetch_factor=2,
     collator=None,
     transform=None,
     camera_frame=False,
@@ -70,6 +71,7 @@ def init_data(
         pin_memory=pin_mem,
         num_workers=num_workers,
         persistent_workers=(num_workers > 0) and persistent_workers,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
     )
 
     logger.info("Behavior video data loader created")
@@ -105,6 +107,8 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
         self.action_dim = action_dim
         self.window_stride = max(1, int(window_stride if window_stride is not None else frames_per_clip))
         self.random_window = random_window
+        self._parquet_cache = {}
+        self._video_reader_cache = {}
 
         if VideoReader is None:
             raise ImportError('Unable to import "decord" which is required to read videos.')
@@ -175,6 +179,22 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
             indices = indices[:: self.frameskip]
         return indices, fstp, max_len
 
+    def _load_parquet(self, ppath):
+        cached = self._parquet_cache.get(ppath)
+        if cached is not None:
+            return cached
+        df = pd.read_parquet(ppath)
+        self._parquet_cache[ppath] = df
+        return df
+
+    def _get_video_reader(self, vpath):
+        cached = self._video_reader_cache.get(vpath)
+        if cached is not None:
+            return cached
+        vr = VideoReader(vpath, num_threads=-1, ctx=cpu(0))
+        self._video_reader_cache[vpath] = vr
+        return vr
+
     def _build_episode_plans(self):
         plans = []
         for sample_idx, sample in enumerate(self.samples):
@@ -223,7 +243,7 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
         vpath = sample["video_path"]
         ppath = sample["parquet_path"]
 
-        df = pd.read_parquet(ppath)
+        df = self._load_parquet(ppath)
         if "observation.state" not in df.columns or "action" not in df.columns:
             raise ValueError(f"Expected `observation.state` and `action` in parquet: {ppath}")
 
@@ -242,7 +262,7 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
             )
 
         states = full_states[:, self.state_start_idx : self.state_start_idx + self.state_dim]
-        vr = VideoReader(vpath, num_threads=-1, ctx=cpu(0))
+        vr = self._get_video_reader(vpath)
 
         fstp = plan["fstp"]
         max_len = min(plan["max_len"], states.shape[0], full_actions.shape[0], len(vr))

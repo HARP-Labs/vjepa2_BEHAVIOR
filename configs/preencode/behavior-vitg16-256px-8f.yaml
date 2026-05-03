@@ -12,6 +12,8 @@ data:
   patch_size: 16
   tubelet_size: 2
   num_workers: 12
+  persistent_workers: true
+  prefetch_factor: 4
   pin_mem: true
   stereo_view: false
   camera_frame: false
@@ -22,3 +24,5 @@ data:
 
   # action is taken directly from parquet column `action`.
   action_dim: 23
+  window_stride: 8
+  random_window: false
