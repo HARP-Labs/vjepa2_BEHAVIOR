@@ -41,7 +41,7 @@ def init_data(
     tubelet_size=2,
     state_start_idx=0,
     state_dim=7,
-    action_dim=7,
+    action_dim=23,
 ):
     dataset = BehaviorVideoDataset(
         data_path=data_path,
@@ -87,7 +87,7 @@ class BehaviorVideoDataset(DROIDVideoDataset):
         camera_frame=False,
         state_start_idx=0,
         state_dim=7,
-        action_dim=7,
+        action_dim=23,
     ):
         self.data_path = data_path
         self.dataset_root = os.path.dirname(os.path.abspath(data_path))
@@ -160,6 +160,11 @@ class BehaviorVideoDataset(DROIDVideoDataset):
 
         full_states = np.asarray(df["observation.state"].to_list(), dtype=np.float32)
         full_actions = np.asarray(df["action"].to_list(), dtype=np.float32)
+
+        if full_actions.shape[1] < self.action_dim:
+            raise ValueError(
+                f"Action dim out of bounds for {ppath}: {full_actions.shape[1]=}, {self.action_dim=}"
+            )
 
         if full_states.shape[1] < self.state_start_idx + self.state_dim:
             raise ValueError(

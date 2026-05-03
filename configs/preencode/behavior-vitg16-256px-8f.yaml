@@ -21,4 +21,4 @@ data:
   state_dim: 7
 
   # action is taken directly from parquet column `action`.
-  action_dim: 7
+  action_dim: 23
