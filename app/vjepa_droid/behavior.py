@@ -33,6 +33,7 @@ def init_data(
     num_workers=10,
     pin_mem=True,
     persistent_workers=True,
+    prefetch_factor=2,
     collator=None,
     transform=None,
     camera_frame=False,
@@ -70,6 +71,7 @@ def init_data(
         pin_memory=pin_mem,
         num_workers=num_workers,
         persistent_workers=(num_workers > 0) and persistent_workers,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
     )
 
     logger.info("Behavior video data loader created")
@@ -105,6 +107,8 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
         self.action_dim = action_dim
         self.window_stride = max(1, int(window_stride if window_stride is not None else frames_per_clip))
         self.random_window = random_window
+        self._parquet_cache = {}
+        self._video_reader_cache = {}
 
         if VideoReader is None:
             raise ImportError('Unable to import "decord" which is required to read videos.')
@@ -175,6 +179,22 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
             indices = indices[:: self.frameskip]
         return indices, fstp, max_len
 
+    def _load_parquet(self, ppath):
+        cached = self._parquet_cache.get(ppath)
+        if cached is not None:
+            return cached
+        df = pd.read_parquet(ppath)
+        self._parquet_cache[ppath] = df
+        return df
+
+    def _get_video_reader(self, vpath):
+        cached = self._video_reader_cache.get(vpath)
+        if cached is not None:
+            return cached
+        vr = VideoReader(vpath, num_threads=-1, ctx=cpu(0))
+        self._video_reader_cache[vpath] = vr
+        return vr
+
     def _build_episode_plans(self):
         plans = []
         for sample_idx, sample in enumerate(self.samples):
@@ -223,7 +243,7 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
         vpath = sample["video_path"]
         ppath = sample["parquet_path"]
 
-        df = pd.read_parquet(ppath)
+        df = self._load_parquet(ppath)
         if "observation.state" not in df.columns or "action" not in df.columns:
             raise ValueError(f"Expected `observation.state` and `action` in parquet: {ppath}")
 
@@ -242,7 +262,7 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
             )
 
         states = full_states[:, self.state_start_idx : self.state_start_idx + self.state_dim]
-        vr = VideoReader(vpath, num_threads=-1, ctx=cpu(0))
+        vr = self._get_video_reader(vpath)
 
         fstp = plan["fstp"]
         max_len = min(plan["max_len"], states.shape[0], full_actions.shape[0], len(vr))
@@ -299,3 +319,75 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
                 sample = self.samples[plan["sample_idx"]]
 
         return buffer, actions, states, extrinsics, indices
+
+
+class BehaviorEpisodePreencoder:
+    """Run a vision encoder on BEHAVIOR clips and save pre-encoded episode shards."""
+
+    def __init__(self, encoder, device=None, dtype=torch.float32):
+        self.encoder = encoder.eval()
+        self.device = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+        self.dtype = dtype
+        self.encoder.to(self.device)
+
+    def _to_video_tensor(self, video):
+        if isinstance(video, np.ndarray):
+            video = torch.from_numpy(video)
+        if video.ndim == 4:
+            video = video.unsqueeze(0)
+        if video.ndim != 5:
+            raise ValueError(f"Expected 5D video tensor, got shape={tuple(video.shape)}")
+        # [B, T, H, W, C] -> [B, C, T, H, W]
+        if video.shape[-1] in (1, 3):
+            video = video.permute(0, 4, 1, 2, 3)
+        return video.to(self.device, dtype=self.dtype, non_blocking=True)
+
+    @torch.no_grad()
+    def encode_dataset(self, data_loader, output_dir, episodes_per_shard=100):
+        os.makedirs(output_dir, exist_ok=True)
+        dataset = data_loader.dataset
+        if not hasattr(dataset, "windows"):
+            raise ValueError("BehaviorEpisodePreencoder requires BehaviorVideoDataset with window metadata.")
+
+        shard_data = []
+        shard_id = 0
+        total = 0
+        for batch_idx, batch in enumerate(data_loader):
+            videos, actions, states, _, _ = batch
+            videos = self._to_video_tensor(videos)
+            tokens = self.encoder(videos)
+            if isinstance(tokens, (tuple, list)):
+                tokens = tokens[0]
+            tokens = tokens.detach().cpu().float().numpy()
+
+            actions_np = actions.detach().cpu().float().numpy() if torch.is_tensor(actions) else np.asarray(actions)
+            states_np = states.detach().cpu().float().numpy() if torch.is_tensor(states) else np.asarray(states)
+
+            for b in range(tokens.shape[0]):
+                dataset_index = batch_idx * data_loader.batch_size + b
+                if dataset_index >= len(dataset.windows):
+                    break
+                episode_idx, _ = dataset.windows[dataset_index]
+                shard_data.append(
+                    {
+                        "episode_idx": int(episode_idx),
+                        "actions": actions_np[b],
+                        "states": states_np[b],
+                        "tokens": tokens[b],
+                    }
+                )
+                total += 1
+
+                if len(shard_data) >= episodes_per_shard:
+                    self._write_shard(output_dir, shard_id, shard_data)
+                    shard_data = []
+                    shard_id += 1
+
+        if shard_data:
+            self._write_shard(output_dir, shard_id, shard_data)
+        logger.info(f"Pre-encoding finished: {total} encoded windows written to {output_dir}")
+
+    def _write_shard(self, output_dir, shard_id, shard_data):
+        save_path = os.path.join(output_dir, f"behavior_preencoded_shard_{shard_id:05d}.pt")
+        torch.save(shard_data, save_path)
+        logger.info(f"Saved shard {shard_id} with {len(shard_data)} items at {save_path}")
