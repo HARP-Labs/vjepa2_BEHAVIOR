@@ -1,10 +1,3 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-#
-
 import json
 import os
 from logging import getLogger
@@ -18,86 +11,26 @@ from decord import VideoReader, cpu
 
 logger = getLogger()
 
-
-def init_data(
-    data_path,
-    batch_size,
-    frames_per_clip=16,
-    fps=5,
-    crop_size=224,
-    rank=0,
-    world_size=1,
-    camera_views=None,
-    stereo_view=False,
-    drop_last=True,
-    num_workers=10,
-    pin_mem=True,
-    persistent_workers=True,
-    prefetch_factor=2,
-    collator=None,
-    transform=None,
-    camera_frame=False,
-    tubelet_size=2,
-    state_start_idx=0,
-    state_dim=7,
-    action_dim=23,
-    window_stride=None,
-    random_window=False,
-):
-    dataset = BehaviorVideoDataset(
-        data_path=data_path,
-        frames_per_clip=frames_per_clip,
-        transform=transform,
-        fps=fps,
-        frameskip=tubelet_size,
-        camera_frame=camera_frame,
-        state_start_idx=state_start_idx,
-        state_dim=state_dim,
-        action_dim=action_dim,
-        window_stride=window_stride if window_stride is not None else frames_per_clip,
-        random_window=random_window,
-    )
-
-    dist_sampler = torch.utils.data.distributed.DistributedSampler(
-        dataset, num_replicas=world_size, rank=rank, shuffle=True
-    )
-
-    data_loader = torch.utils.data.DataLoader(
-        dataset,
-        collate_fn=collator,
-        sampler=dist_sampler,
-        batch_size=batch_size,
-        drop_last=drop_last,
-        pin_memory=pin_mem,
-        num_workers=num_workers,
-        persistent_workers=(num_workers > 0) and persistent_workers,
-        prefetch_factor=prefetch_factor if num_workers > 0 else None,
-    )
-
-    logger.info("Behavior video data loader created")
-    return data_loader, dist_sampler
-
-
 class BehaviorVideoDataset(torch.utils.data.Dataset):
     """BEHAVIOR dataset with deterministic episode-chunk sampling for pre-encoding/training."""
 
     def __init__(
         self,
         data_path,
-        frameskip=2,
-        frames_per_clip=16,
+        frameskip=2, # TODO remove the second subsampling form the pipeline we only need on subsample knob  
+        fpcs=16,
         fps=5,
         transform=None,
         camera_frame=False,
         state_start_idx=0,
         state_dim=7,
         action_dim=23,
-        window_stride=None,
+        window_stride=None, #TODO maybe lest fix this to fpcs exactly 
         random_window=False,
     ):
         self.data_path = data_path
         self.dataset_root = os.path.dirname(os.path.abspath(data_path))
-        self.frames_per_clip = frames_per_clip
+        self.frames_per_clip = fpcs
         self.frameskip = frameskip
         self.fps = fps
         self.transform = transform
@@ -105,7 +38,7 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
         self.state_start_idx = state_start_idx
         self.state_dim = state_dim
         self.action_dim = action_dim
-        self.window_stride = max(1, int(window_stride if window_stride is not None else frames_per_clip))
+        self.window_stride = max(1, int(window_stride if window_stride is not None else fpcs))
         self.random_window = random_window
         self._parquet_cache = {}
         self._video_reader_cache = {}
@@ -122,7 +55,7 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
         with open(manifest_path, "r") as f:
             return json.load(f)
 
-    def _resolve_episode_layout(self, task_name, episode_file):
+    def _resolve_episode_layout(self, task_name, episode_file): #TODO lets remove this fallback 
         if task_name is not None and episode_file is not None:
             episode_name = os.path.splitext(os.path.basename(episode_file))[0]
             base = os.path.join(self.dataset_root, task_name)
@@ -137,7 +70,7 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
         for ep in manifest.get("episodes", []):
             task_name = ep.get("task_name")
             episode_file = ep.get("episode_file")
-            fallback = self._resolve_episode_layout(task_name, episode_file)
+            fallback = self._resolve_episode_layout(task_name, episode_file) #TODO lets remove this if we dont have a path in the manifest we want an warning 
 
             video_rel = ep.get("video_file") or (ep.get("video_files") or [None])[0]
             parquet_rel = ep.get("data_parquet_file")
@@ -145,16 +78,16 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
             video_path = (
                 os.path.join(self.dataset_root, video_rel)
                 if video_rel is not None
-                else (fallback["video"] if fallback is not None else None)
+                else (fallback["video"] if fallback is not None else None) #TODO remove th efallback + warning 
             )
             parquet_path = (
                 os.path.join(self.dataset_root, parquet_rel)
                 if parquet_rel is not None
-                else (fallback["parquet"] if fallback is not None else None)
+                else (fallback["parquet"] if fallback is not None else None) #TODO remove th efallback + warning
             )
 
             if video_path is None or parquet_path is None:
-                continue
+                continue #TODO throw a warning 
 
             samples.append({"video_path": video_path, "parquet_path": parquet_path})
 
