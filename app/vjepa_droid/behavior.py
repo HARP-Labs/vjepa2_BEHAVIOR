@@ -55,7 +55,7 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
         with open(manifest_path, "r") as f:
             return json.load(f)
 
-    def _resolve_episode_layout(self, task_name, episode_file): #TODO lets remove this fallback 
+    def _resolve_episode_layout(self, task_name, episode_file): #TODO merge in _parse_samples since we only want this paths creation 
         if task_name is not None and episode_file is not None:
             episode_name = os.path.splitext(os.path.basename(episode_file))[0]
             base = os.path.join(self.dataset_root, task_name)
@@ -65,12 +65,12 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
             }
         return None
 
-    def _parse_samples(self, manifest):
+    def _parse_samples(self, manifest): # TODO remove since the paths in manifest are not correct. 
         samples = []
         for ep in manifest.get("episodes", []):
             task_name = ep.get("task_name")
             episode_file = ep.get("episode_file")
-            fallback = self._resolve_episode_layout(task_name, episode_file) #TODO lets remove this if we dont have a path in the manifest we want an warning 
+            fallback = self._resolve_episode_layout(task_name, episode_file) 
 
             video_rel = ep.get("video_file") or (ep.get("video_files") or [None])[0]
             parquet_rel = ep.get("data_parquet_file")
@@ -78,13 +78,12 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
             video_path = (
                 os.path.join(self.dataset_root, video_rel)
                 if video_rel is not None
-                else (fallback["video"] if fallback is not None else None) #TODO remove th efallback + warning 
+                else (fallback["video"] if fallback is not None else None) 
             )
             parquet_path = (
                 os.path.join(self.dataset_root, parquet_rel)
                 if parquet_rel is not None
-                else (fallback["parquet"] if fallback is not None else None) #TODO remove th efallback + warning
-            )
+                else (fallback["parquet"] if fallback is not None else None)) 
 
             if video_path is None or parquet_path is None:
                 continue #TODO throw a warning 
