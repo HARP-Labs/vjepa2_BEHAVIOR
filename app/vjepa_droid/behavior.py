@@ -280,14 +280,35 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
             pad = np.full((self.frames_per_clip - len(window_indices),), window_indices[-1], dtype=np.int64)
             window_indices = np.concatenate([window_indices, pad])
 
-        states = states[window_indices, :]
-
-        # Aggregate raw per-step actions between sampled points for this window.
+        # Stack raw per-step actions/states between sampled points for this window.
+        raw_states = states
         raw_actions = full_actions[:, : self.action_dim]
+        states = []
         actions = []
         for i, start in enumerate(window_indices):
             end = window_indices[i + 1] if i + 1 < len(window_indices) else min(start + fstp, max_len)
-            actions.append(raw_actions[start:end].sum(axis=0))
+            state_chunk = raw_states[start:end]
+            action_chunk = raw_actions[start:end]
+
+            if len(state_chunk) == 0:
+                state_chunk = np.zeros((fstp, self.state_dim), dtype=np.float32)
+            elif len(state_chunk) < fstp:
+                pad = np.repeat(state_chunk[-1:], fstp - len(state_chunk), axis=0)
+                state_chunk = np.concatenate([state_chunk, pad], axis=0)
+            else:
+                state_chunk = state_chunk[:fstp]
+
+            if len(action_chunk) == 0:
+                action_chunk = np.zeros((fstp, self.action_dim), dtype=np.float32)
+            elif len(action_chunk) < fstp:
+                pad = np.repeat(action_chunk[-1:], fstp - len(action_chunk), axis=0)
+                action_chunk = np.concatenate([action_chunk, pad], axis=0)
+            else:
+                action_chunk = action_chunk[:fstp]
+
+            states.append(state_chunk)
+            actions.append(action_chunk)
+        states = np.asarray(states, dtype=np.float32)
         actions = np.asarray(actions, dtype=np.float32)
 
         vr.seek(0)
@@ -352,7 +373,7 @@ class BehaviorEpisodePreencoder:
         shard_data = []
         shard_id = 0
         total = 0
-        for batch_idx, batch in enumerate(data_loader):
+        for batch in data_loader:
             videos, actions, states, _, _ = batch
             videos = self._to_video_tensor(videos)
             tokens = self.encoder(videos)
@@ -364,13 +385,8 @@ class BehaviorEpisodePreencoder:
             states_np = states.detach().cpu().float().numpy() if torch.is_tensor(states) else np.asarray(states)
 
             for b in range(tokens.shape[0]):
-                dataset_index = batch_idx * data_loader.batch_size + b
-                if dataset_index >= len(dataset.windows):
-                    break
-                episode_idx, _ = dataset.windows[dataset_index]
                 shard_data.append(
                     {
-                        "episode_idx": int(episode_idx),
                         "actions": actions_np[b],
                         "states": states_np[b],
                         "tokens": tokens[b],
@@ -386,6 +402,64 @@ class BehaviorEpisodePreencoder:
         if shard_data:
             self._write_shard(output_dir, shard_id, shard_data)
         logger.info(f"Pre-encoding finished: {total} encoded windows written to {output_dir}")
+
+    @torch.no_grad()
+    def encode_full_episodes(self, dataset, output_dir, episodes_per_shard=100, batch_size=8):
+        os.makedirs(output_dir, exist_ok=True)
+        shard_data = []
+        shard_id = 0
+
+        for episode_idx, plan in enumerate(dataset.episode_plans):
+            sample = dataset.samples[plan["sample_idx"]]
+            total_steps = len(plan["indices"])
+
+            starts = list(range(0, total_steps, dataset.frames_per_clip))
+            all_tokens, all_actions, all_states, all_indices = [], [], [], []
+            for i in range(0, len(starts), batch_size):
+                batch_starts = starts[i : i + batch_size]
+                batch_videos, batch_actions, batch_states, batch_indices, valid_lens = [], [], [], [], []
+
+                for start_idx in batch_starts:
+                    valid_len = min(dataset.frames_per_clip, total_steps - start_idx)
+                    videos, actions, states, _, frame_indices = dataset.loadvideo_decord(
+                        sample, plan, start_idx=start_idx
+                    )
+                    batch_videos.append(videos)
+                    batch_actions.append(actions)
+                    batch_states.append(states)
+                    batch_indices.append(frame_indices)
+                    valid_lens.append(valid_len)
+
+                videos = self._to_video_tensor(np.stack(batch_videos, axis=0))
+                tokens = self.encoder(videos)
+                if isinstance(tokens, (tuple, list)):
+                    tokens = tokens[0]
+                tokens = tokens.detach().cpu().float().numpy()
+
+                for j, valid_len in enumerate(valid_lens):
+                    all_tokens.append(tokens[j, :valid_len])
+                    all_actions.append(batch_actions[j][:valid_len])
+                    all_states.append(batch_states[j][:valid_len])
+                    all_indices.append(batch_indices[j][:valid_len])
+
+            shard_data.append(
+                {
+                    "episode_idx": int(episode_idx),
+                    "tokens": np.concatenate(all_tokens, axis=0),
+                    "actions": np.concatenate(all_actions, axis=0),
+                    "states": np.concatenate(all_states, axis=0),
+                    "frame_indices": np.concatenate(all_indices, axis=0),
+                }
+            )
+
+            if len(shard_data) >= episodes_per_shard:
+                self._write_shard(output_dir, shard_id, shard_data)
+                shard_id += 1
+                shard_data = []
+
+        if shard_data:
+            self._write_shard(output_dir, shard_id, shard_data)
+        logger.info(f"Pre-encoding finished: {len(dataset.episode_plans)} episodes encoded to {output_dir}")
 
     def _write_shard(self, output_dir, shard_id, shard_data):
         save_path = os.path.join(output_dir, f"behavior_preencoded_shard_{shard_id:05d}.pt")
