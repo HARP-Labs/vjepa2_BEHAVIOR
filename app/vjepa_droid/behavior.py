@@ -17,29 +17,23 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
     def __init__(
         self,
         data_path,
-        frameskip=2, # TODO remove the second subsampling form the pipeline we only need on subsample knob  
         fpcs=16,
         fps=5,
         transform=None,
         camera_frame=False,
         state_start_idx=0,
         state_dim=7,
-        action_dim=23,
-        window_stride=None, #TODO maybe lest fix this to fpcs exactly 
-        random_window=False,
+        action_dim=23
     ):
         self.data_path = data_path
         self.dataset_root = os.path.dirname(os.path.abspath(data_path))
-        self.frames_per_clip = fpcs
-        self.frameskip = frameskip
+        self.fpc = fpcs
         self.fps = fps
         self.transform = transform
         self.camera_frame = camera_frame
         self.state_start_idx = state_start_idx
         self.state_dim = state_dim
         self.action_dim = action_dim
-        self.window_stride = max(1, int(window_stride if window_stride is not None else fpcs))
-        self.random_window = random_window
         self._parquet_cache = {}
         self._video_reader_cache = {}
 
@@ -55,77 +49,27 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
         with open(manifest_path, "r") as f:
             return json.load(f)
 
-    def _resolve_episode_layout(self, task_name, episode_file): #TODO merge in _parse_samples since we only want this paths creation 
-        if task_name is not None and episode_file is not None:
-            episode_name = os.path.splitext(os.path.basename(episode_file))[0]
-            base = os.path.join(self.dataset_root, task_name)
-            return {
-                "video": os.path.join(base, "video", f"{episode_name}.mp4"),
-                "parquet": os.path.join(base, "data", f"{episode_name}.parquet"),
-            }
-        return None
-
-    def _parse_samples(self, manifest): # TODO remove since the paths in manifest are not correct. 
+    def _parse_samples(self, manifest):
         samples = []
         for ep in manifest.get("episodes", []):
             task_name = ep.get("task_name")
             episode_file = ep.get("episode_file")
-            fallback = self._resolve_episode_layout(task_name, episode_file) 
-
-            video_rel = ep.get("video_file") or (ep.get("video_files") or [None])[0]
-            parquet_rel = ep.get("data_parquet_file")
-
-            video_path = (
-                os.path.join(self.dataset_root, video_rel)
-                if video_rel is not None
-                else (fallback["video"] if fallback is not None else None) 
-            )
-            parquet_path = (
-                os.path.join(self.dataset_root, parquet_rel)
-                if parquet_rel is not None
-                else (fallback["parquet"] if fallback is not None else None)) 
-
-            if video_path is None or parquet_path is None:
-                continue #TODO throw a warning 
-
-            samples.append({"video_path": video_path, "parquet_path": parquet_path})
+            if task_name is None or episode_file is None:
+                # TODO: throw a warning
+                continue
+            episode_name = os.path.splitext(os.path.basename(episode_file))[0]
+            base = os.path.join(self.dataset_root, task_name)
+            video_path = os.path.join(base, "video", f"{episode_name}.mp4")
+            parquet_path = os.path.join(base, "data", f"{episode_name}.parquet")
+            samples.append({
+                "video_path": video_path,
+                "parquet_path": parquet_path,
+            })
 
         if not samples:
             raise ValueError(f"No episodes found in manifest: {self.data_path}")
+
         return samples
-
-    def _episode_sampled_indices(self, sample):
-        vpath = sample["video_path"]
-        ppath = sample["parquet_path"]
-        vr = VideoReader(vpath, num_threads=-1, ctx=cpu(0))
-        vfps = vr.get_avg_fps()
-        fps = self.fps if self.fps is not None else vfps
-        fstp = ceil(vfps / fps)
-        vlen = len(vr)
-        parquet_len = len(pd.read_parquet(ppath, columns=["action"]))
-        max_len = min(vlen, parquet_len)
-        if max_len < fstp:
-            return None, fstp, max_len
-        indices = np.arange(0, max_len, fstp, dtype=np.int64)
-        if self.frameskip > 1:
-            indices = indices[:: self.frameskip]
-        return indices, fstp, max_len
-
-    def _load_parquet(self, ppath):
-        cached = self._parquet_cache.get(ppath)
-        if cached is not None:
-            return cached
-        df = pd.read_parquet(ppath)
-        self._parquet_cache[ppath] = df
-        return df
-
-    def _get_video_reader(self, vpath):
-        cached = self._video_reader_cache.get(vpath)
-        if cached is not None:
-            return cached
-        vr = VideoReader(vpath, num_threads=-1, ctx=cpu(0))
-        self._video_reader_cache[vpath] = vr
-        return vr
 
     def _build_episode_plans(self):
         plans = []
@@ -133,7 +77,7 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
             try:
                 indices, fstp, max_len = self._episode_sampled_indices(sample)
                 if indices is None or len(indices) == 0:
-                    continue
+                    continue #TODO throw a warning here about skipping this episode due to insufficient length
                 plans.append(
                     {
                         "sample_idx": sample_idx,
@@ -148,115 +92,48 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
             raise ValueError(f"No valid episode plans found in manifest: {self.data_path}")
         logger.info(f"Built {len(plans)} valid episode plans")
         return plans
+    
+    def _episode_sampled_indices(self, sample):
+        vpath = sample["video_path"]
+        ppath = sample["parquet_path"]
+        vr = VideoReader(vpath, num_threads=-1, ctx=cpu(0))
+        vfps = vr.get_avg_fps()
+        fps = self.fps if self.fps is not None else vfps #TODO throw an error 
+        fstp = ceil(vfps / fps)
+        vlen = len(vr)
+        parquet_len = len(pd.read_parquet(ppath, columns=["action"]))
+        #TODO assert vlen vs parquet len and throw a warning if needed 
+        max_len = min(vlen, parquet_len)
+        if max_len < fstp:
+            return None, fstp, max_len #TODO throw a warning 
+        indices = np.arange(0, max_len, fstp, dtype=np.int64)
+        return indices, fstp, max_len
 
     def _build_window_index(self):
         windows = []
         for episode_idx, plan in enumerate(self.episode_plans):
             indices = plan["indices"]
             n = len(indices)
-            if n <= self.frames_per_clip:
-                windows.append((episode_idx, 0))
+            if n == 0:
+                # TODO: throw a warning
                 continue
-            max_start = n - self.frames_per_clip
-            for start in range(0, max_start + 1, self.window_stride):
+            for start in range(0, n, self.fpc):
                 windows.append((episode_idx, start))
-            if max_start % self.window_stride != 0:
-                windows.append((episode_idx, max_start))
-
         if not windows:
             raise ValueError(f"No valid windows found in manifest: {self.data_path}")
-        logger.info(f"Built BEHAVIOR window index with {len(windows)} windows from {len(self.samples)} episodes")
+        logger.info(
+            f"Built BEHAVIOR window index with {len(windows)} non-overlapping windows "
+            f"from {len(self.episode_plans)} valid episode plans"
+        )
         return windows
-
+    
     def __len__(self):
         return len(self.windows)
-
-    def loadvideo_decord(self, sample, plan, start_idx=0):
-        vpath = sample["video_path"]
-        ppath = sample["parquet_path"]
-
-        df = self._load_parquet(ppath)
-        if "observation.state" not in df.columns or "action" not in df.columns:
-            raise ValueError(f"Expected `observation.state` and `action` in parquet: {ppath}")
-
-        full_states = np.asarray(df["observation.state"].to_list(), dtype=np.float32)
-        full_actions = np.asarray(df["action"].to_list(), dtype=np.float32)
-
-        if full_actions.shape[1] < self.action_dim:
-            raise ValueError(
-                f"Action dim out of bounds for {ppath}: {full_actions.shape[1]=}, {self.action_dim=}"
-            )
-
-        if full_states.shape[1] < self.state_start_idx + self.state_dim:
-            raise ValueError(
-                f"State slice out of bounds for {ppath}: {full_states.shape[1]=}, "
-                f"{self.state_start_idx=}, {self.state_dim=}"
-            )
-
-        states = full_states[:, self.state_start_idx : self.state_start_idx + self.state_dim]
-        vr = self._get_video_reader(vpath)
-
-        fstp = plan["fstp"]
-        max_len = min(plan["max_len"], states.shape[0], full_actions.shape[0], len(vr))
-        indices = plan["indices"]
-        if len(indices) == 0:
-            raise Exception(f"No indices in episode plan for {vpath=}, {fstp=}, {max_len=}")
-
-        if self.random_window and len(indices) > self.frames_per_clip:
-            max_start = len(indices) - self.frames_per_clip
-            start_idx = np.random.randint(0, max_start + 1)
-
-        end_idx = min(start_idx + self.frames_per_clip, len(indices))
-        window_indices = indices[start_idx:end_idx]
-        if len(window_indices) < self.frames_per_clip:
-            pad = np.full((self.frames_per_clip - len(window_indices),), window_indices[-1], dtype=np.int64)
-            window_indices = np.concatenate([window_indices, pad])
-
-        # Stack raw per-step actions/states between sampled points for this window.
-        raw_states = states
-        raw_actions = full_actions[:, : self.action_dim]
-        states = []
-        actions = []
-        for i, start in enumerate(window_indices):
-            end = window_indices[i + 1] if i + 1 < len(window_indices) else min(start + fstp, max_len)
-            state_chunk = raw_states[start:end]
-            action_chunk = raw_actions[start:end]
-
-            if len(state_chunk) == 0:
-                state_chunk = np.zeros((fstp, self.state_dim), dtype=np.float32)
-            elif len(state_chunk) < fstp:
-                pad = np.repeat(state_chunk[-1:], fstp - len(state_chunk), axis=0)
-                state_chunk = np.concatenate([state_chunk, pad], axis=0)
-            else:
-                state_chunk = state_chunk[:fstp]
-
-            if len(action_chunk) == 0:
-                action_chunk = np.zeros((fstp, self.action_dim), dtype=np.float32)
-            elif len(action_chunk) < fstp:
-                pad = np.repeat(action_chunk[-1:], fstp - len(action_chunk), axis=0)
-                action_chunk = np.concatenate([action_chunk, pad], axis=0)
-            else:
-                action_chunk = action_chunk[:fstp]
-
-            states.append(state_chunk)
-            actions.append(action_chunk)
-        states = np.asarray(states, dtype=np.float32)
-        actions = np.asarray(actions, dtype=np.float32)
-
-        vr.seek(0)
-        buffer = vr.get_batch(window_indices).asnumpy()
-        if self.transform is not None:
-            buffer = self.transform(buffer)
-
-        # No extrinsics in BEHAVIOR parquet for now; keep predictor API-compatible.
-        extrinsics = np.zeros((states.shape[0], 6), dtype=np.float32)
-        return buffer, actions, states, extrinsics, window_indices
 
     def __getitem__(self, index):
         episode_idx, start_idx = self.windows[index]
         plan = self.episode_plans[episode_idx]
         sample = self.samples[plan["sample_idx"]]
-
         loaded_video = False
         while not loaded_video:
             try:
@@ -273,6 +150,105 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
 
         return buffer, actions, states, extrinsics, indices
 
+    def loadvideo_decord(self, sample, plan, start_idx=0):
+        vpath = sample["video_path"]
+        ppath = sample["parquet_path"]
+        df = self._load_parquet(ppath)
+        if "observation.state" not in df.columns or "action" not in df.columns:
+            raise ValueError(f"Expected `observation.state` and `action` in parquet: {ppath}")
+        full_states = np.asarray(df["observation.state"].to_list(), dtype=np.float32)
+        full_actions = np.asarray(df["action"].to_list(), dtype=np.float32)
+
+        if full_actions.shape[1] < self.action_dim:
+            raise ValueError(
+                f"Action dim out of bounds for {ppath}: {full_actions.shape[1]=}, {self.action_dim=}"
+            )
+
+        if full_states.shape[1] < self.state_start_idx + self.state_dim:
+            raise ValueError(
+                f"State slice out of bounds for {ppath}: {full_states.shape[1]=}, "
+                f"{self.state_start_idx=}, {self.state_dim=}"
+            )
+
+        states = full_states[:, self.state_start_idx : self.state_start_idx + self.state_dim]
+        vr = self._get_video_reader(vpath)
+        fstp = plan["fstp"]
+        max_len = min(plan["max_len"], states.shape[0], full_actions.shape[0], len(vr)) #TODO lets use the primery soruce and throw an error possibly
+        indices = plan["indices"]
+
+        if len(indices) == 0:
+            raise Exception(f"No indices in episode plan for {vpath=}, {fstp=}, {max_len=}")
+
+        end_idx = min(start_idx + self.fpc, len(indices))
+        window_indices = indices[start_idx:end_idx]
+        if len(window_indices) < self.fpc:
+            pad = np.full((self.fpc - len(window_indices),), window_indices[-1], dtype=np.int64)
+            window_indices = np.concatenate([window_indices, pad])
+
+        raw_states = states
+        raw_actions = full_actions[:, : self.action_dim] #TODO lets use the full and assert 
+        states = []
+        actions = []
+        for i, start in enumerate(window_indices):
+            end = window_indices[i + 1] if i + 1 < len(window_indices) else min(start + fstp, max_len)
+
+            state_chunk = raw_states[start:end]
+            action_chunk = raw_actions[start:end]
+
+            if len(state_chunk) == 0:
+                logger.warning(f"Empty state chunk for {vpath=}, {start=}, {end=}")
+                state_chunk = np.zeros((fstp, self.state_dim), dtype=np.float32)
+            elif len(state_chunk) < fstp:
+                logger.warning(
+                    f"Short state chunk for {vpath=}, {start=}, {end=}, "
+                    f"len={len(state_chunk)}, expected={fstp}"
+                )
+                pad = np.repeat(state_chunk[-1:], fstp - len(state_chunk), axis=0)
+                state_chunk = np.concatenate([state_chunk, pad], axis=0)
+            else:
+                state_chunk = state_chunk[:fstp]
+
+            if len(action_chunk) == 0:
+                logger.warning(f"Empty action chunk for {vpath=}, {start=}, {end=}")
+                action_chunk = np.zeros((fstp, self.action_dim), dtype=np.float32)
+            elif len(action_chunk) < fstp:
+                logger.warning(
+                    f"Short action chunk for {vpath=}, {start=}, {end=}, "
+                    f"len={len(action_chunk)}, expected={fstp}"
+                )
+                pad = np.repeat(action_chunk[-1:], fstp - len(action_chunk), axis=0)
+                action_chunk = np.concatenate([action_chunk, pad], axis=0)
+            else:
+                action_chunk = action_chunk[:fstp]
+
+            states.append(state_chunk.reshape(fstp * self.state_dim))
+            actions.append(action_chunk.reshape(fstp * self.action_dim))
+
+        states = np.asarray(states, dtype=np.float32)
+        actions = np.asarray(actions, dtype=np.float32)
+        vr.seek(0)
+        buffer = vr.get_batch(window_indices).asnumpy()
+        if self.transform is not None:
+            buffer = self.transform(buffer)
+        extrinsics = np.zeros((states.shape[0], 6), dtype=np.float32)
+        return buffer, actions, states, extrinsics, window_indices
+    
+    def _load_parquet(self, ppath):
+        cached = self._parquet_cache.get(ppath)
+        if cached is not None:
+            return cached
+        df = pd.read_parquet(ppath)
+        self._parquet_cache[ppath] = df
+        return df
+
+    def _get_video_reader(self, vpath):
+        cached = self._video_reader_cache.get(vpath)
+        if cached is not None:
+            return cached
+        vr = VideoReader(vpath, num_threads=-1, ctx=cpu(0))
+        self._video_reader_cache[vpath] = vr
+        return vr
+    
 
 class BehaviorEpisodePreencoder:
     """Run a vision encoder on BEHAVIOR clips and save pre-encoded episode shards."""
