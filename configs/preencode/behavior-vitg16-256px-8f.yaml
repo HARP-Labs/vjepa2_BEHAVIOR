@@ -17,9 +17,9 @@ data:
   datasets:
     - /your_file_path/behavior/manifest.json
   dataset_fpcs:
-    - 8
+    - 16
   batch_size: 8
-  fps: 4
+  fps: 5
   crop_size: 256
   patch_size: 16
   tubelet_size: 2
