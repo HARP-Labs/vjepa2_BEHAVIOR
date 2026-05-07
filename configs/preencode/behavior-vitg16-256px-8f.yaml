@@ -33,6 +33,18 @@ data:
   state_dim: 7
   action_dim: 23
 
+data_aug:
+  auto_augment: false
+  horizontal_flip: false
+  motion_shift: false
+  random_resize_aspect_ratio:
+    - 0.75
+    - 1.35
+  random_resize_scale:
+    - 1.777
+    - 1.777
+  reprob: 0.0
+
 output:
   # optional local mirror; set to null to only stream to HF
   local_output_dir: null
