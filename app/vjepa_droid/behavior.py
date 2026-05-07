@@ -148,7 +148,17 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
                 plan = self.episode_plans[episode_idx]
                 sample = self.samples[plan["sample_idx"]]
 
-        return buffer, actions, states, extrinsics, indices
+        valid_len = min(self.fpc, len(plan["indices"]) - start_idx)
+        return {
+            "video": buffer,
+            "actions": actions,
+            "states": states,
+            "extrinsics": extrinsics,
+            "frame_indices": indices,
+            "episode_idx": episode_idx,
+            "start_idx": start_idx,
+            "valid_len": valid_len,
+        }
 
     def loadvideo_decord(self, sample, plan, start_idx=0):
         vpath = sample["video_path"]
@@ -249,7 +259,6 @@ class BehaviorVideoDataset(torch.utils.data.Dataset):
         self._video_reader_cache[vpath] = vr
         return vr
     
-
 class BehaviorEpisodePreencoder:
     """Run a vision encoder on BEHAVIOR clips and save pre-encoded episode shards."""
 
@@ -270,95 +279,108 @@ class BehaviorEpisodePreencoder:
         if video.shape[-1] in (1, 3):
             video = video.permute(0, 4, 1, 2, 3)
         return video.to(self.device, dtype=self.dtype, non_blocking=True)
+    
+    def behavior_preencode_collate(batch):
+        return {
+            "video": np.stack([item["video"] for item in batch], axis=0),
+            "actions": np.stack([item["actions"] for item in batch], axis=0),
+            "states": np.stack([item["states"] for item in batch], axis=0),
+            "frame_indices": np.stack([item["frame_indices"] for item in batch], axis=0),
+            "episode_idx": np.asarray([item["episode_idx"] for item in batch], dtype=np.int64),
+            "start_idx": np.asarray([item["start_idx"] for item in batch], dtype=np.int64),
+            "valid_len": np.asarray([item["valid_len"] for item in batch], dtype=np.int64),
+        }
 
     @torch.no_grad()
-    def encode_dataset(self, data_loader, output_dir, episodes_per_shard=100):
+    def encode_full_episodes(
+        self,
+        dataset,
+        output_dir,
+        episodes_per_shard=1,
+        batch_size=8,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=2,
+    ):
         os.makedirs(output_dir, exist_ok=True)
-        dataset = data_loader.dataset
-        if not hasattr(dataset, "windows"):
-            raise ValueError("BehaviorEpisodePreencoder requires BehaviorVideoDataset with window metadata.")
 
-        shard_data = []
-        shard_id = 0
-        total = 0
+        data_loader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=(persistent_workers and num_workers > 0),
+            prefetch_factor=prefetch_factor if num_workers > 0 else None,
+            collate_fn=self.behavior_preencode_collate,
+        )
+
+        episode_buffers = {
+            episode_idx: {
+                "tokens": [],
+                "actions": [],
+                "states": [],
+                "frame_indices": [],
+                "starts": [],
+            }
+            for episode_idx in range(len(dataset.episode_plans))
+        }
+
         for batch in data_loader:
-            videos, actions, states, _, _ = batch
-            videos = self._to_video_tensor(videos)
+            videos = self._to_video_tensor(batch["video"])
+
             tokens = self.encoder(videos)
             if isinstance(tokens, (tuple, list)):
                 tokens = tokens[0]
+
             tokens = tokens.detach().cpu().float().numpy()
 
-            actions_np = actions.detach().cpu().float().numpy() if torch.is_tensor(actions) else np.asarray(actions)
-            states_np = states.detach().cpu().float().numpy() if torch.is_tensor(states) else np.asarray(states)
+            actions = batch["actions"]
+            states = batch["states"]
+            frame_indices = batch["frame_indices"]
+            episode_indices = batch["episode_idx"]
+            start_indices = batch["start_idx"]
+            valid_lens = batch["valid_len"]
 
             for b in range(tokens.shape[0]):
-                shard_data.append(
-                    {
-                        "actions": actions_np[b],
-                        "states": states_np[b],
-                        "tokens": tokens[b],
-                    }
-                )
-                total += 1
+                episode_idx = int(episode_indices[b])
+                start_idx = int(start_indices[b])
+                valid_len = int(valid_lens[b])
 
-                if len(shard_data) >= episodes_per_shard:
-                    self._write_shard(output_dir, shard_id, shard_data)
-                    shard_data = []
-                    shard_id += 1
+                episode_buffers[episode_idx]["tokens"].append(tokens[b, :valid_len])
+                episode_buffers[episode_idx]["actions"].append(actions[b, :valid_len])
+                episode_buffers[episode_idx]["states"].append(states[b, :valid_len])
+                episode_buffers[episode_idx]["frame_indices"].append(frame_indices[b, :valid_len])
+                episode_buffers[episode_idx]["starts"].append(start_idx)
 
-        if shard_data:
-            self._write_shard(output_dir, shard_id, shard_data)
-        logger.info(f"Pre-encoding finished: {total} encoded windows written to {output_dir}")
-
-    @torch.no_grad()
-    def encode_full_episodes(self, dataset, output_dir, episodes_per_shard=100, batch_size=8):
-        os.makedirs(output_dir, exist_ok=True)
         shard_data = []
         shard_id = 0
+        encoded_episodes = 0
 
-        for episode_idx, plan in enumerate(dataset.episode_plans):
-            sample = dataset.samples[plan["sample_idx"]]
-            total_steps = len(plan["indices"])
+        for episode_idx, buffer in episode_buffers.items():
+            if not buffer["tokens"]:
+                logger.warning(f"Skipping empty encoded episode {episode_idx}")
+                continue 
+            order = np.argsort(buffer["starts"])
 
-            starts = list(range(0, total_steps, dataset.frames_per_clip))
-            all_tokens, all_actions, all_states, all_indices = [], [], [], []
-            for i in range(0, len(starts), batch_size):
-                batch_starts = starts[i : i + batch_size]
-                batch_videos, batch_actions, batch_states, batch_indices, valid_lens = [], [], [], [], []
-
-                for start_idx in batch_starts:
-                    valid_len = min(dataset.frames_per_clip, total_steps - start_idx)
-                    videos, actions, states, _, frame_indices = dataset.loadvideo_decord(
-                        sample, plan, start_idx=start_idx
-                    )
-                    batch_videos.append(videos)
-                    batch_actions.append(actions)
-                    batch_states.append(states)
-                    batch_indices.append(frame_indices)
-                    valid_lens.append(valid_len)
-
-                videos = self._to_video_tensor(np.stack(batch_videos, axis=0))
-                tokens = self.encoder(videos)
-                if isinstance(tokens, (tuple, list)):
-                    tokens = tokens[0]
-                tokens = tokens.detach().cpu().float().numpy()
-
-                for j, valid_len in enumerate(valid_lens):
-                    all_tokens.append(tokens[j, :valid_len])
-                    all_actions.append(batch_actions[j][:valid_len])
-                    all_states.append(batch_states[j][:valid_len])
-                    all_indices.append(batch_indices[j][:valid_len])
+            tokens = np.concatenate([buffer["tokens"][i] for i in order], axis=0)
+            actions = np.concatenate([buffer["actions"][i] for i in order], axis=0)
+            states = np.concatenate([buffer["states"][i] for i in order], axis=0)
+            frame_indices = np.concatenate([buffer["frame_indices"][i] for i in order], axis=0)
 
             shard_data.append(
                 {
                     "episode_idx": int(episode_idx),
-                    "tokens": np.concatenate(all_tokens, axis=0),
-                    "actions": np.concatenate(all_actions, axis=0),
-                    "states": np.concatenate(all_states, axis=0),
-                    "frame_indices": np.concatenate(all_indices, axis=0),
+                    "sample_idx": int(dataset.episode_plans[episode_idx]["sample_idx"]),
+                    "tokens": tokens,
+                    "actions": actions,
+                    "states": states,
+                    "frame_indices": frame_indices,
                 }
             )
+
+            encoded_episodes += 1
 
             if len(shard_data) >= episodes_per_shard:
                 self._write_shard(output_dir, shard_id, shard_data)
@@ -367,7 +389,10 @@ class BehaviorEpisodePreencoder:
 
         if shard_data:
             self._write_shard(output_dir, shard_id, shard_data)
-        logger.info(f"Pre-encoding finished: {len(dataset.episode_plans)} episodes encoded to {output_dir}")
+
+        logger.info(
+            f"Pre-encoding finished: {encoded_episodes} episodes encoded to {output_dir}"
+        )
 
     def _write_shard(self, output_dir, shard_id, shard_data):
         save_path = os.path.join(output_dir, f"behavior_preencoded_shard_{shard_id:05d}.pt")
