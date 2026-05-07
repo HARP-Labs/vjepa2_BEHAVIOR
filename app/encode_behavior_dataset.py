@@ -30,13 +30,9 @@ def main(cfg_path: str):
         tubelet_size=data_cfg["tubelet_size"],
         model_name=model_cfg["model_name"],
         crop_size=data_cfg["crop_size"],
-        pred_depth=model_cfg.get("pred_depth", 6),
-        pred_num_heads=model_cfg.get("pred_num_heads"),
-        pred_embed_dim=model_cfg.get("pred_embed_dim", 384),
         use_sdpa=meta_cfg.get("use_sdpa", False),
         use_rope=model_cfg.get("use_rope", False),
         use_silu=model_cfg.get("use_silu", False),
-        use_pred_silu=model_cfg.get("use_pred_silu", False),
         wide_silu=model_cfg.get("wide_silu", False),
     )
 

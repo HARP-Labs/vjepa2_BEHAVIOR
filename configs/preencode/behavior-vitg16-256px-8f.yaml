@@ -9,12 +9,8 @@ meta:
 
 model:
   model_name: vit_giant2
-  pred_depth: 12
-  pred_num_heads: 16
-  pred_embed_dim: 384
   use_rope: true
   use_silu: false
-  use_pred_silu: false
   wide_silu: true
 
 data:
