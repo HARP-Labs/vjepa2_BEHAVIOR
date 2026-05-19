@@ -325,7 +325,7 @@ class VisionTransformer(nn.Module):
                 out_norm = self.norms_block[out_idx](x)
                 outs.append(out_norm)
 
-            if i in self.out_layers_distillation:
+            if (training or self.return_hierarchical) and i in self.out_layers_distillation:
                 out_idx = self.hierarchical_layers.index(i)
                 hier.append(self.norms_block[out_idx](x))
 
