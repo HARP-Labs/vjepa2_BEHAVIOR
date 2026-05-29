@@ -42,6 +42,7 @@ class VisionTransformerPredictorAC(nn.Module):
         use_activation_checkpointing=False,
         use_rope=True,
         action_embed_dim=7,
+        state_embed_dim=None,
         use_extrinsics=False,
         **kwargs
     ):
@@ -50,9 +51,10 @@ class VisionTransformerPredictorAC(nn.Module):
         self.use_extrinsics = use_extrinsics
 
         # Map input to predictor dimension
+        _state_dim = state_embed_dim if state_embed_dim is not None else action_embed_dim
         self.predictor_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
         self.action_encoder = nn.Linear(action_embed_dim, predictor_embed_dim, bias=True)
-        self.state_encoder = nn.Linear(action_embed_dim, predictor_embed_dim, bias=True)
+        self.state_encoder = nn.Linear(_state_dim, predictor_embed_dim, bias=True)
         self.extrinsics_encoder = nn.Linear(action_embed_dim - 1, predictor_embed_dim, bias=True)
 
         # Determine positional embedding

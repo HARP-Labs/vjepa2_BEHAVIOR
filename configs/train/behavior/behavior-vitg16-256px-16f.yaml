@@ -1,0 +1,83 @@
+app: vjepa_behavior
+
+# Output folder for logs and checkpoints
+folder: /checkpoints/behavior-vitg16-256px-16f
+
+meta:
+  resume_checkpoint: null   # relative filename inside `folder`, e.g. "e10.pt"
+  dtype: bfloat16
+  seed: 0
+  save_every_freq: -1       # -1 = only keep latest; set to N to also save every N epochs
+  skip_batches: -1
+  sync_gc: false
+
+data:
+  # MosaicML Streaming source (HuggingFace Hub or local path)
+  remote: "hf://datasets/<org>/<repo>/<split>"
+  local: "/tmp/behavior_mds_cache"
+
+  # Which cameras to include; concatenated in this order along token dim
+  cameras: [head, left_wrist, right_wrist]
+
+  # Temporal clip length (number of MDS steps = frames per clip)
+  frames_per_clip: 8
+
+  # Token count per camera per frame (= (crop_px // patch_px)^2)
+  # ViT-G/16 at 256px: (256//16)^2 = 256
+  tpf_per_cam: 256
+
+  # ViT-G encoder embed dimension
+  embed_dim: 1408
+
+  # Frame stride used during the pre-encoding run (ceil(video_fps / target_fps))
+  # 30fps video at 5fps target → fstp=6; action chunk dim = fstp * 23 = 138
+  action_fstp: 6
+
+  batch_size: 32
+  num_workers: 8
+  pin_mem: true
+  persistent_workers: true
+
+model:
+  # Must match embed_dim in data section
+  embed_dim: 1408
+  patch_size: 16
+
+  # Number of active cameras (must match len(data.cameras))
+  n_cameras: 3
+
+  # Predictor architecture
+  pred_depth: 24
+  pred_embed_dim: 1024
+  pred_num_heads: 16
+  pred_is_frame_causal: true
+
+  # action_embed_dim = action_fstp * 23
+  action_embed_dim: 138
+  # state_embed_dim = 133-dim proprioceptive vector (see DATASET_SCHEMA.md)
+  state_embed_dim: 133
+
+  uniform_power: true
+  use_rope: true
+  use_silu: false
+  wide_silu: true
+  use_activation_checkpointing: true
+  compile_model: false
+
+loss:
+  loss_exp: 1.0          # 1.0 = L1 loss
+  auto_steps: 2          # number of autoregressive rollout steps
+  normalize_reps: true   # layer-norm embeddings before loss
+
+optimization:
+  epochs: 100
+  warmup: 5              # warmup epochs
+  anneal: 10             # annealing epochs (WSD schedule)
+  ipe: null              # null = auto-detect from dataset length
+  lr: 0.000425
+  start_lr: 0.000075
+  final_lr: 0.0
+  weight_decay: 0.04
+  final_weight_decay: 0.04
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
