@@ -64,18 +64,32 @@ class BehaviorMDSDataset(torch.utils.data.Dataset):
             logger.info(f"Clip index saved to {index_path} ({len(self.clips_index)} clips)")
 
     def _build_index(self):
+        # Episodes are contiguous and sorted by step_pos, so we only need to
+        # read the first row of each episode (step_pos == 0) to get episode_len,
+        # then derive all valid clip starts mathematically. This is O(N_episodes)
+        # reads instead of O(N_samples) reads — typically 50-200x faster.
         T = self.frames_per_clip
-        meta_ds = StreamingDataset(
-            remote=self.remote,
-            local=self.local,
-            shuffle=False,
-            columns=["step_pos", "episode_len"],
-        )
-        valid_starts = [
-            i for i in range(len(meta_ds))
-            if int(meta_ds[i]["episode_len"]) - int(meta_ds[i]["step_pos"]) >= T
-        ]
-        return np.array(valid_starts, dtype=np.int64)
+        clips = []
+        global_row = 0
+        n_rows = len(self._ds)
+
+        while global_row < n_rows:
+            row = self._ds[global_row]
+            episode_len = int(row["episode_len"])
+            step_pos = int(row["step_pos"])
+
+            if step_pos != 0:
+                raise RuntimeError(
+                    f"Expected episode start (step_pos=0) at global row {global_row}, "
+                    f"got step_pos={step_pos}. Dataset rows are not sorted by episode/step."
+                )
+
+            for t in range(max(0, episode_len - T + 1)):
+                clips.append(global_row + t)
+
+            global_row += episode_len
+
+        return np.array(clips, dtype=np.int64)
 
     def __len__(self):
         return len(self.clips_index)
@@ -85,6 +99,17 @@ class BehaviorMDSDataset(torch.utils.data.Dataset):
         T = self.frames_per_clip
 
         rows = [self._ds[row_start + t] for t in range(T)]
+
+        # Validate that all rows are from the same episode and step_pos is consecutive.
+        ep0 = int(rows[0]["episode_idx"])
+        sp0 = int(rows[0]["step_pos"])
+        for t in range(1, T):
+            if int(rows[t]["episode_idx"]) != ep0 or int(rows[t]["step_pos"]) != sp0 + t:
+                raise RuntimeError(
+                    f"Clip at row_start={row_start} is not contiguous within one episode "
+                    f"(row {row_start+t}: episode_idx={rows[t]['episode_idx']}, "
+                    f"step_pos={rows[t]['step_pos']}, expected episode {ep0} step {sp0+t})."
+                )
 
         # --- tokens: concatenate active camera views along token dim ---
         cam_token_list = []

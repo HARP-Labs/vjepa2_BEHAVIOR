@@ -55,7 +55,11 @@ class VisionTransformerPredictorAC(nn.Module):
         self.predictor_embed = nn.Linear(embed_dim, predictor_embed_dim, bias=True)
         self.action_encoder = nn.Linear(action_embed_dim, predictor_embed_dim, bias=True)
         self.state_encoder = nn.Linear(_state_dim, predictor_embed_dim, bias=True)
-        self.extrinsics_encoder = nn.Linear(action_embed_dim - 1, predictor_embed_dim, bias=True)
+        # Only create the extrinsics encoder when it will actually be used.
+        # For BEHAVIOR (use_extrinsics=False) this avoids wasted parameters and
+        # the need for find_unused_parameters=True in DDP.
+        if use_extrinsics:
+            self.extrinsics_encoder = nn.Linear(action_embed_dim - 1, predictor_embed_dim, bias=True)
 
         # Determine positional embedding
         if type(img_size) is int:

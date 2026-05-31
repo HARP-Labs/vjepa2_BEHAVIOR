@@ -49,6 +49,10 @@ def init_predictor(
     distinguish token origin by camera view.
     """
     patch_grid = int(tpf_per_cam ** 0.5)  # e.g. 16 for 256-token frames
+    assert patch_grid * patch_grid == tpf_per_cam, (
+        f"tpf_per_cam={tpf_per_cam} must be a perfect square for spatial RoPE "
+        f"(got patch_grid={patch_grid}, patch_grid^2={patch_grid*patch_grid})"
+    )
     img_h = patch_grid * patch_size                   # e.g. 256
     img_w = n_cameras * patch_grid * patch_size       # e.g. 768 for 3 cams
 

@@ -102,6 +102,11 @@ def main(args, resume_preempt=False):
     pin_mem = cfgs_data.get("pin_mem", True)
     persistent_workers = cfgs_data.get("persistent_workers", True)
 
+    patch_grid = int(tpf_per_cam ** 0.5)
+    assert patch_grid * patch_grid == tpf_per_cam, (
+        f"tpf_per_cam={tpf_per_cam} must be a perfect square for spatial RoPE "
+        f"(got patch_grid={patch_grid}, patch_grid^2={patch_grid*patch_grid})"
+    )
     # tokens_per_frame = all camera tokens stacked per temporal step
     tokens_per_frame = n_cameras * tpf_per_cam
 
@@ -228,7 +233,7 @@ def main(args, resume_preempt=False):
         eps=eps,
     )
 
-    predictor = DistributedDataParallel(predictor, static_graph=False, find_unused_parameters=True)
+    predictor = DistributedDataParallel(predictor, static_graph=False)
     cam_embed = DistributedDataParallel(cam_embed, static_graph=True)
 
     start_epoch = 0
@@ -319,9 +324,9 @@ def main(args, resume_preempt=False):
                         raise e
 
             # -- unpack batch
-            # tokens:  [B, T, N_cams*tpf, D]  float16
-            # actions: [B, T, action_embed_dim] float32
-            # states:  [B, T, state_embed_dim]  float32
+            # tokens:  [B, T, n_cameras*tpf_per_cam, embed_dim]  float16
+            # actions: [B, T, fstp*23]  float32  (raw action chunk per frame)
+            # states:  [B, T, 133]      float32  (proprioceptive state per frame)
             def load_batch():
                 tokens_cpu = sample[0]   # float16
                 actions = sample[1].to(device, dtype=torch.float32, non_blocking=True)
