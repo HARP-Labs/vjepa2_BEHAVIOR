@@ -80,7 +80,7 @@ def main(args, resume_preempt=False):
     patch_size = cfgs_model.get("patch_size", 16)
     n_cameras = cfgs_model.get("n_cameras")
     pred_depth = cfgs_model.get("pred_depth")
-    pred_num_heads = cfgs_model.get("pred_num_heads", None)
+    pred_num_heads = cfgs_model.get("pred_num_heads", 16)
     pred_embed_dim = cfgs_model.get("pred_embed_dim")
     pred_is_frame_causal = cfgs_model.get("pred_is_frame_causal", True)
     action_embed_dim = cfgs_model.get("action_embed_dim")
@@ -114,7 +114,7 @@ def main(args, resume_preempt=False):
     cfgs_loss = args.get("loss")
     loss_exp = cfgs_loss.get("loss_exp", 1.0)
     normalize_reps = cfgs_loss.get("normalize_reps", True)
-    auto_steps = min(cfgs_loss.get("auto_steps", 2), frames_per_clip)
+    auto_steps = min(cfgs_loss.get("auto_steps", 2), frames_per_clip - 1)
 
     # -- OPTIMIZATION
     cfgs_opt = args.get("optimization")
@@ -346,22 +346,19 @@ def main(args, resume_preempt=False):
                 _new_wd = wd_scheduler.step()
 
                 def build_h(tok):
-                    emb = cam_embed(cam_indices)  # [N_cams, D]
+                    emb = cam_embed(cam_indices)  # [n_cameras, D]
                     B, T, _, D = tok.shape
-                    patch_grid = int(tpf_per_cam ** 0.5)
 
-                    # Add cam embedding and reshape each camera to its spatial grid
-                    cam_grids = []
+                    # Add per-camera bias; each camera becomes its own predictor "frame"
+                    # so all cameras share the same symmetric (H=patch_grid, W=patch_grid)
+                    # RoPE grid. Camera identity is carried solely by cam_embed.
+                    cam_segs = []
                     for c in range(n_cameras):
-                        s = tok[:, :, c * tpf_per_cam:(c + 1) * tpf_per_cam, :] + emb[c]
-                        cam_grids.append(s.view(B, T, patch_grid, patch_grid, D))
+                        seg = tok[:, :, c * tpf_per_cam:(c + 1) * tpf_per_cam, :] + emb[c]
+                        cam_segs.append(seg)
 
-                    # Stack cameras side-by-side: [B, T, patch_grid, n_cameras, patch_grid, D]
-                    # Reshape merges (patch_grid, n_cameras, patch_grid) in C order so that
-                    # virtual position (row r, col cam*patch_grid+w) = camera cam, spatial (r, w).
-                    # This gives ACRoPEAttention coherent height/width positions per camera.
-                    h = torch.stack(cam_grids, dim=3)
-                    h = h.reshape(B, T, n_cameras * tpf_per_cam, D).flatten(1, 2)
+                    # [B, T, n_cameras, tpf, D] → [B, T*n_cameras*tpf, D]
+                    h = torch.stack(cam_segs, dim=2).flatten(1, 3)
                     if normalize_reps:
                         h = F.layer_norm(h, (h.size(-1),))
                     return h
@@ -373,17 +370,19 @@ def main(args, resume_preempt=False):
                     return _z
 
                 def forward_predictions(z, act, sta):
-                    # Teacher forcing: context = all but last frame's tokens
-                    _z = z[:, :-tokens_per_frame]                  # [B, (T-1)*tpf, D]
-                    _a = act                                        # [B, T-1, action_dim]
-                    _s = sta                                        # [B, T-1, state_dim]
+                    # Teacher forcing: exclude last real frame (all n_cameras camera slots)
+                    _z = z[:, :-tokens_per_frame]
+                    # Each real-timestep action/state is shared across all n_cameras
+                    # predictor-frames for that timestep.
+                    _a = act.repeat_interleave(n_cameras, dim=1)
+                    _s = sta.repeat_interleave(n_cameras, dim=1)
                     z_tf = _step_predictor(_z, _a, _s)
 
                     # Autoregressive rollout
                     _z = torch.cat([z[:, :tokens_per_frame], z_tf[:, :tokens_per_frame]], dim=1)
                     for n in range(1, auto_steps):
-                        _a_n = act[:, : n + 1]
-                        _s_n = sta[:, : n + 1]
+                        _a_n = act[:, : n + 1].repeat_interleave(n_cameras, dim=1)
+                        _s_n = sta[:, : n + 1].repeat_interleave(n_cameras, dim=1)
                         _z_nxt = _step_predictor(_z, _a_n, _s_n)[:, -tokens_per_frame:]
                         _z = torch.cat([_z, _z_nxt], dim=1)
                     z_ar = _z[:, tokens_per_frame:]

@@ -6,8 +6,6 @@
 
 import logging
 import sys
-from functools import partial
-
 import torch
 import torch.nn as nn
 
@@ -42,24 +40,29 @@ def init_predictor(
     """
     Instantiate VisionTransformerPredictorAC for the BEHAVIOR pre-encoded setting.
 
-    The AC predictor grid is set to (patch_grid, n_cameras * patch_grid) so that
-    all camera tokens within a frame share a consistent spatial indexing for RoPE.
+    Each camera occupies its own predictor "frame" slot so all cameras share the
+    same symmetric (patch_grid × patch_grid) RoPE grid. Camera identity is carried
+    exclusively by cam_embed (an additive bias in feature space), avoiding the
+    asymmetric height/width RoPE scaling that a virtual wide-image layout would cause.
 
-    Also returns a learnable camera embedding (nn.Embedding) so the predictor can
-    distinguish token origin by camera view.
+    The predictor therefore sees num_frames * n_cameras temporal "frames", each with
+    tpf_per_cam tokens. Returns (predictor, cam_embed).
     """
-    patch_grid = int(tpf_per_cam ** 0.5)  # e.g. 16 for 256-token frames
+    if pred_num_heads is None:
+        pred_num_heads = 16
+
+    patch_grid = int(tpf_per_cam ** 0.5)
     assert patch_grid * patch_grid == tpf_per_cam, (
         f"tpf_per_cam={tpf_per_cam} must be a perfect square for spatial RoPE "
         f"(got patch_grid={patch_grid}, patch_grid^2={patch_grid*patch_grid})"
     )
-    img_h = patch_grid * patch_size                   # e.g. 256
-    img_w = n_cameras * patch_grid * patch_size       # e.g. 768 for 3 cams
+    img_h = patch_grid * patch_size
+    img_w = patch_grid * patch_size  # symmetric: same spatial grid for every camera
 
     predictor = vit_ac_pred.vit_ac_predictor(
         img_size=(img_h, img_w),
         patch_size=patch_size,
-        num_frames=num_frames,
+        num_frames=num_frames * n_cameras,  # one predictor-frame per (camera, timestep)
         tubelet_size=1,
         embed_dim=embed_dim,
         predictor_embed_dim=pred_embed_dim,
