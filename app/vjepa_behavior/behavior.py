@@ -47,6 +47,8 @@ class BehaviorMDSDataset(torch.utils.data.Dataset):
     ):
         self.cameras = cameras
         self.frames_per_clip = frames_per_clip
+        self.remote = remote
+        self.local = local
 
         self._ds = StreamingDataset(remote=remote, local=local, shuffle=shuffle)
 
@@ -62,19 +64,17 @@ class BehaviorMDSDataset(torch.utils.data.Dataset):
             logger.info(f"Clip index saved to {index_path} ({len(self.clips_index)} clips)")
 
     def _build_index(self):
-        """
-        Scan all rows reading only episode_idx / step_pos / episode_len.
-        Returns row indices of valid clip starts (at least frames_per_clip steps remain).
-        """
         T = self.frames_per_clip
-        valid_starts = []
-        n = len(self._ds)
-        for i in range(n):
-            row = self._ds[i]
-            step_pos = int(row["step_pos"])
-            episode_len = int(row["episode_len"])
-            if episode_len - step_pos >= T:
-                valid_starts.append(i)
+        meta_ds = StreamingDataset(
+            remote=self.remote,
+            local=self.local,
+            shuffle=False,
+            columns=["step_pos", "episode_len"],
+        )
+        valid_starts = [
+            i for i in range(len(meta_ds))
+            if int(meta_ds[i]["episode_len"]) - int(meta_ds[i]["step_pos"]) >= T
+        ]
         return np.array(valid_starts, dtype=np.int64)
 
     def __len__(self):

@@ -228,7 +228,7 @@ def main(args, resume_preempt=False):
         eps=eps,
     )
 
-    predictor = DistributedDataParallel(predictor, static_graph=False, find_unused_parameters=False)
+    predictor = DistributedDataParallel(predictor, static_graph=False, find_unused_parameters=True)
     cam_embed = DistributedDataParallel(cam_embed, static_graph=True)
 
     start_epoch = 0
@@ -341,18 +341,22 @@ def main(args, resume_preempt=False):
                 _new_wd = wd_scheduler.step()
 
                 def build_h(tok):
-                    """
-                    Add per-camera learned embeddings then flatten to
-                    [B, T*tokens_per_frame, embed_dim].
-                    tok: [B, T, N_cams*tpf_per_cam, D]
-                    """
-                    # cam_embed weight: (N_cams, D) — add to each camera slice
-                    emb = cam_embed(cam_indices)  # (N_cams, D)
+                    emb = cam_embed(cam_indices)  # [N_cams, D]
+                    B, T, _, D = tok.shape
+                    patch_grid = int(tpf_per_cam ** 0.5)
+
+                    # Add cam embedding and reshape each camera to its spatial grid
+                    cam_grids = []
                     for c in range(n_cameras):
-                        s, e = c * tpf_per_cam, (c + 1) * tpf_per_cam
-                        tok[:, :, s:e, :] = tok[:, :, s:e, :] + emb[c]
-                    # [B, T*tpf_total, D]
-                    h = tok.flatten(1, 2)
+                        s = tok[:, :, c * tpf_per_cam:(c + 1) * tpf_per_cam, :] + emb[c]
+                        cam_grids.append(s.view(B, T, patch_grid, patch_grid, D))
+
+                    # Stack cameras side-by-side: [B, T, patch_grid, n_cameras, patch_grid, D]
+                    # Reshape merges (patch_grid, n_cameras, patch_grid) in C order so that
+                    # virtual position (row r, col cam*patch_grid+w) = camera cam, spatial (r, w).
+                    # This gives ACRoPEAttention coherent height/width positions per camera.
+                    h = torch.stack(cam_grids, dim=3)
+                    h = h.reshape(B, T, n_cameras * tpf_per_cam, D).flatten(1, 2)
                     if normalize_reps:
                         h = F.layer_norm(h, (h.size(-1),))
                     return h
