@@ -86,7 +86,7 @@ class VisionTransformerPredictorAC(nn.Module):
             [
                 Block(
                     use_rope=use_rope,
-                    grid_size=self.grid_height,
+                    grid_size=max(self.grid_height, self.grid_width),
                     dim=predictor_embed_dim,
                     num_heads=num_heads,
                     mlp_ratio=mlp_ratio,

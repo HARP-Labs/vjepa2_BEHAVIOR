@@ -400,8 +400,8 @@ def main(args, resume_preempt=False):
 
                     # actions/states: context frames only (all but last)
                     z_tf, z_ar = forward_predictions(h, actions[:, :-1], states[:, :-1])
-                    jloss = loss_fn(z_tf, h)
-                    sloss = loss_fn(z_ar, h)
+                    jloss = loss_fn(z_tf, h.detach())
+                    sloss = loss_fn(z_ar, h.detach())
                     loss = jloss + sloss
 
                 if mixed_precision:
