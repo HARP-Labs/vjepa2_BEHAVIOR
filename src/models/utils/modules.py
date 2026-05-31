@@ -165,15 +165,26 @@ class ACRoPEAttention(nn.Module):
         width_ids = (ids - tokens_per_frame * frame_ids) - tokens_per_row * height_ids
         return 1.0 * frame_ids, 1.0 * height_ids, 1.0 * width_ids
 
-    def forward(self, x, mask=None, attn_mask=None, T=None, H=None, W=None, action_tokens=0):
+    def forward(
+        self, x, mask=None, attn_mask=None, T=None, H=None, W=None,
+        action_tokens=0, cameras_per_frame=1,
+    ):
         B, N, C = x.size()
+        img_per_frame = cameras_per_frame * H * W
 
-        # -- compute position of each frame token
+        # -- compute position of each image token. When cameras_per_frame > 1, all
+        # cameras at the same physical step reuse the same per-camera (h, w) RoPE
+        # positions; camera identity is carried elsewhere (e.g. cam_embed).
         if mask is not None:
             mask = mask.unsqueeze(1).repeat(1, self.num_heads, 1)
             d_mask, h_mask, w_mask = self.separate_positions(mask, H, W)
         else:
-            mask = torch.arange(int(T * H * W), device=x.device)
+            if cameras_per_frame == 1:
+                mask = torch.arange(int(T * H * W), device=x.device)
+            else:
+                per_step = torch.arange(H * W, device=x.device).repeat(cameras_per_frame)
+                steps = torch.arange(T, device=x.device).unsqueeze(1) * (H * W)
+                mask = (steps + per_step.unsqueeze(0)).flatten()
             d_mask, h_mask, w_mask = self.separate_positions(mask, H, W)
 
         # -- snap spatial positions to grid size
@@ -182,7 +193,7 @@ class ACRoPEAttention(nn.Module):
 
         # -- split out action tokens from sequence
         if action_tokens > 0:
-            x = x.view(B, -1, action_tokens + H * W, C)  # [B, T, 1+H*W, D]
+            x = x.view(B, -1, action_tokens + img_per_frame, C)  # [B, T, A+cam*H*W, D]
 
             action_q, action_k, action_v = [], [], []
             for i in range(action_tokens):
@@ -236,8 +247,8 @@ class ACRoPEAttention(nn.Module):
         if action_tokens > 0:
 
             def merge_(tx, ta):
-                """tx, tx in [B, num_heads, N, D]"""
-                tx = tx.view(B, self.num_heads, T, H * W, -1)  # [B, T, H*W, D]
+                """tx, ta in [B, num_heads, N, D]"""
+                tx = tx.view(B, self.num_heads, T, img_per_frame, -1)  # [B, T, cam*H*W, D]
                 ta = ta.view(B, self.num_heads, T, action_tokens, -1)  # [B, T, A, D]
                 return torch.cat([ta, tx], dim=3).flatten(2, 3)
 
@@ -490,10 +501,16 @@ class ACBlock(nn.Module):
         else:
             self.mlp = MLP(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
-    def forward(self, x, mask=None, attn_mask=None, T=None, H=None, W=None, action_tokens=0):
+    def forward(
+        self, x, mask=None, attn_mask=None, T=None, H=None, W=None,
+        action_tokens=0, cameras_per_frame=1,
+    ):
         y = self.norm1(x)
         if isinstance(self.attn, ACRoPEAttention):
-            y = self.attn(y, mask=mask, attn_mask=attn_mask, T=T, H=H, W=W, action_tokens=action_tokens)
+            y = self.attn(
+                y, mask=mask, attn_mask=attn_mask, T=T, H=H, W=W,
+                action_tokens=action_tokens, cameras_per_frame=cameras_per_frame,
+            )
         else:
             y = self.attn(y, mask=mask, attn_mask=attn_mask)
         x = x + self.drop_path(y)

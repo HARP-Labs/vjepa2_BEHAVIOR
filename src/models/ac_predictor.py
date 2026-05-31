@@ -44,11 +44,16 @@ class VisionTransformerPredictorAC(nn.Module):
         action_embed_dim=7,
         state_embed_dim=None,
         use_extrinsics=False,
+        cameras_per_frame=1,
         **kwargs
     ):
         super().__init__()
         self.is_frame_causal = is_frame_causal
         self.use_extrinsics = use_extrinsics
+        # Number of camera views packed into each predictor "frame". Each camera
+        # contributes grid_height*grid_width tokens that share per-camera (h, w)
+        # RoPE positions; identity must be carried elsewhere (e.g. cam_embed).
+        self.cameras_per_frame = cameras_per_frame
 
         # Map input to predictor dimension
         _state_dim = state_embed_dim if state_embed_dim is not None else action_embed_dim
@@ -117,8 +122,13 @@ class VisionTransformerPredictorAC(nn.Module):
             grid_depth = self.num_frames // self.tubelet_size
             grid_height = self.img_height // self.patch_size
             grid_width = self.img_width // self.patch_size
+            # Block size = add_tokens + cameras_per_frame * H * W. Pass cameras_per_frame
+            # via H' so the existing builder produces the right per-physical-step block.
             attn_mask = build_action_block_causal_attention_mask(
-                grid_depth, grid_height, grid_width, add_tokens=3 if use_extrinsics else 2
+                grid_depth,
+                self.cameras_per_frame * grid_height,
+                grid_width,
+                add_tokens=3 if use_extrinsics else 2,
             )
         self.attn_mask = attn_mask
 
@@ -146,17 +156,19 @@ class VisionTransformerPredictorAC(nn.Module):
         # Map tokens to predictor dimensions
         x = self.predictor_embed(x)
         B, N_ctxt, D = x.size()
-        T = N_ctxt // (self.grid_height * self.grid_width)
+        img_per_frame = self.cameras_per_frame * self.grid_height * self.grid_width
+        T = N_ctxt // img_per_frame
 
-        # Interleave action tokens
+        # Interleave action tokens (one action + one state per physical step,
+        # shared across all cameras_per_frame views)
         s = self.state_encoder(states).unsqueeze(2)
         a = self.action_encoder(actions).unsqueeze(2)
-        x = x.view(B, T, self.grid_height * self.grid_width, D)  # [B, T, H*W, D]
+        x = x.view(B, T, img_per_frame, D)  # [B, T, cam*H*W, D]
         if self.use_extrinsics:
             e = self.extrinsics_encoder(extrinsics).unsqueeze(2)
-            x = torch.cat([a, s, e, x], dim=2).flatten(1, 2)  # [B, T*(H*W+3), D]
+            x = torch.cat([a, s, e, x], dim=2).flatten(1, 2)  # [B, T*(cam*H*W+3), D]
         else:
-            x = torch.cat([a, s, x], dim=2).flatten(1, 2)  # [B, T*(H*W+2), D]
+            x = torch.cat([a, s, x], dim=2).flatten(1, 2)  # [B, T*(cam*H*W+2), D]
 
         cond_tokens = 3 if self.use_extrinsics else 2
         attn_mask = self.attn_mask[: x.size(1), : x.size(1)].to(x.device, non_blocking=True)
@@ -173,6 +185,7 @@ class VisionTransformerPredictorAC(nn.Module):
                     H=self.grid_height,
                     W=self.grid_width,
                     action_tokens=cond_tokens,
+                    cameras_per_frame=self.cameras_per_frame,
                     use_reentrant=False,
                 )
             else:
@@ -184,10 +197,11 @@ class VisionTransformerPredictorAC(nn.Module):
                     H=self.grid_height,
                     W=self.grid_width,
                     action_tokens=cond_tokens,
+                    cameras_per_frame=self.cameras_per_frame,
                 )
 
         # Split out action and frame tokens
-        x = x.view(B, T, cond_tokens + self.grid_height * self.grid_width, D)  # [B, T, K+H*W, D]
+        x = x.view(B, T, cond_tokens + img_per_frame, D)  # [B, T, K+cam*H*W, D]
         x = x[:, :, cond_tokens:, :].flatten(1, 2)
 
         x = self.predictor_norm(x)

@@ -12,6 +12,7 @@ import torch.nn as nn
 import src.models.ac_predictor as vit_ac_pred
 from src.utils.checkpoint_loader import robust_checkpoint_loader
 from src.utils.schedulers import CosineWDSchedule, WSDSchedule
+from src.utils.tensors import trunc_normal_
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO)
 logger = logging.getLogger()
@@ -40,13 +41,12 @@ def init_predictor(
     """
     Instantiate VisionTransformerPredictorAC for the BEHAVIOR pre-encoded setting.
 
-    Each camera occupies its own predictor "frame" slot so all cameras share the
-    same symmetric (patch_grid × patch_grid) RoPE grid. Camera identity is carried
-    exclusively by cam_embed (an additive bias in feature space), avoiding the
-    asymmetric height/width RoPE scaling that a virtual wide-image layout would cause.
-
-    The predictor therefore sees num_frames * n_cameras temporal "frames", each with
-    tpf_per_cam tokens. Returns (predictor, cam_embed).
+    One physical timestep = one predictor "frame" containing all n_cameras camera
+    views. Each camera contributes tpf_per_cam tokens that share the same per-camera
+    (h, w) RoPE positions; camera identity is carried solely by cam_embed (additive
+    bias in feature space). One shared action token + one shared state token per
+    physical step. Block-causal attention across physical steps; full attention
+    within. Returns (predictor, cam_embed).
     """
     if pred_num_heads is None:
         pred_num_heads = 16
@@ -57,12 +57,12 @@ def init_predictor(
         f"(got patch_grid={patch_grid}, patch_grid^2={patch_grid*patch_grid})"
     )
     img_h = patch_grid * patch_size
-    img_w = patch_grid * patch_size  # symmetric: same spatial grid for every camera
+    img_w = patch_grid * patch_size  # symmetric: same per-camera spatial grid
 
     predictor = vit_ac_pred.vit_ac_predictor(
         img_size=(img_h, img_w),
         patch_size=patch_size,
-        num_frames=num_frames * n_cameras,  # one predictor-frame per (camera, timestep)
+        num_frames=num_frames,  # one predictor frame per physical timestep
         tubelet_size=1,
         embed_dim=embed_dim,
         predictor_embed_dim=pred_embed_dim,
@@ -78,9 +78,13 @@ def init_predictor(
         wide_silu=wide_silu,
         use_activation_checkpointing=use_activation_checkpointing,
         use_extrinsics=False,
+        cameras_per_frame=n_cameras,
     )
 
     cam_embed = nn.Embedding(n_cameras, embed_dim)
+    # Default nn.Embedding init is N(0, 1) which dominates layer-normed token
+    # features; match the predictor's trunc_normal init scale.
+    trunc_normal_(cam_embed.weight, std=0.02)
 
     predictor.to(device)
     cam_embed.to(device)
@@ -100,15 +104,15 @@ def load_checkpoint(r_path, predictor, cam_embed, opt=None, scaler=None):
 
     epoch = checkpoint["epoch"]
 
-    pretrained_dict = checkpoint["predictor"]
-    pretrained_dict = {k.replace("module.", ""): v for k, v in pretrained_dict.items()}
-    msg = predictor.load_state_dict(pretrained_dict, strict=False)
+    # Both `predictor` and `cam_embed` are DDP-wrapped at the call site, so the
+    # saved state_dicts keep their `module.` prefix and must be loaded as-is.
+    # Previously this stripped `module.`, which caused every key to silently land
+    # in `missing_keys` (strict=False) and resumed training from random init.
+    msg = predictor.load_state_dict(checkpoint["predictor"], strict=False)
     logger.info(f"Loaded predictor from epoch {epoch}: {msg}")
 
     if "cam_embed" in checkpoint:
-        pretrained_dict = checkpoint["cam_embed"]
-        pretrained_dict = {k.replace("module.", ""): v for k, v in pretrained_dict.items()}
-        msg = cam_embed.load_state_dict(pretrained_dict, strict=False)
+        msg = cam_embed.load_state_dict(checkpoint["cam_embed"], strict=False)
         logger.info(f"Loaded cam_embed from epoch {epoch}: {msg}")
 
     if opt is not None and "opt" in checkpoint:

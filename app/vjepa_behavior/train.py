@@ -102,13 +102,17 @@ def main(args, resume_preempt=False):
     pin_mem = cfgs_data.get("pin_mem", True)
     persistent_workers = cfgs_data.get("persistent_workers", True)
 
+    assert len(cameras) == n_cameras, (
+        f"data.cameras={cameras} (len={len(cameras)}) must match model.n_cameras={n_cameras}"
+    )
+
     patch_grid = int(tpf_per_cam ** 0.5)
     assert patch_grid * patch_grid == tpf_per_cam, (
         f"tpf_per_cam={tpf_per_cam} must be a perfect square for spatial RoPE "
         f"(got patch_grid={patch_grid}, patch_grid^2={patch_grid*patch_grid})"
     )
-    # tokens_per_frame = all camera tokens stacked per temporal step
-    tokens_per_frame = n_cameras * tpf_per_cam
+    # Image tokens per physical step (one predictor "frame" packs all cameras)
+    tokens_per_phys_step = n_cameras * tpf_per_cam
 
     # -- LOSS
     cfgs_loss = args.get("loss")
@@ -194,7 +198,7 @@ def main(args, resume_preempt=False):
     if compile_model:
         logger.info("Compiling predictor.")
         torch._dynamo.config.optimize_ddp = False
-        predictor = torch.compile(predictor)
+        predictor.compile()
 
     # -- init data-loader
     _, unsupervised_loader, unsupervised_sampler = make_behavior_dataset(
@@ -347,18 +351,18 @@ def main(args, resume_preempt=False):
 
                 def build_h(tok):
                     emb = cam_embed(cam_indices)  # [n_cameras, D]
-                    B, T, _, D = tok.shape
 
-                    # Add per-camera bias; each camera becomes its own predictor "frame"
-                    # so all cameras share the same symmetric (H=patch_grid, W=patch_grid)
-                    # RoPE grid. Camera identity is carried solely by cam_embed.
+                    # Concatenate cameras contiguously within each physical step so
+                    # the predictor sees one frame per physical step containing all
+                    # n_cameras views. Per-camera (h, w) RoPE positions are reused
+                    # across cameras inside ACRoPEAttention; cam_embed carries identity.
                     cam_segs = []
                     for c in range(n_cameras):
                         seg = tok[:, :, c * tpf_per_cam:(c + 1) * tpf_per_cam, :] + emb[c]
                         cam_segs.append(seg)
 
-                    # [B, T, n_cameras, tpf, D] → [B, T*n_cameras*tpf, D]
-                    h = torch.stack(cam_segs, dim=2).flatten(1, 3)
+                    # [B, T, n_cameras*tpf, D] → [B, T*n_cameras*tpf, D]
+                    h = torch.cat(cam_segs, dim=2).flatten(1, 2)
                     if normalize_reps:
                         h = F.layer_norm(h, (h.size(-1),))
                     return h
@@ -370,27 +374,24 @@ def main(args, resume_preempt=False):
                     return _z
 
                 def forward_predictions(z, act, sta):
-                    # Teacher forcing: exclude last real frame (all n_cameras camera slots)
-                    _z = z[:, :-tokens_per_frame]
-                    # Each real-timestep action/state is shared across all n_cameras
-                    # predictor-frames for that timestep.
-                    _a = act.repeat_interleave(n_cameras, dim=1)
-                    _s = sta.repeat_interleave(n_cameras, dim=1)
-                    z_tf = _step_predictor(_z, _a, _s)
+                    # Teacher forcing: drop the last physical step (all cameras at T-1)
+                    _z = z[:, :-tokens_per_phys_step]
+                    # One shared action+state token per physical step (no per-camera repeat)
+                    z_tf = _step_predictor(_z, act, sta)
 
                     # Autoregressive rollout
-                    _z = torch.cat([z[:, :tokens_per_frame], z_tf[:, :tokens_per_frame]], dim=1)
+                    _z = torch.cat([z[:, :tokens_per_phys_step], z_tf[:, :tokens_per_phys_step]], dim=1)
                     for n in range(1, auto_steps):
-                        _a_n = act[:, : n + 1].repeat_interleave(n_cameras, dim=1)
-                        _s_n = sta[:, : n + 1].repeat_interleave(n_cameras, dim=1)
-                        _z_nxt = _step_predictor(_z, _a_n, _s_n)[:, -tokens_per_frame:]
+                        _a_n = act[:, : n + 1]
+                        _s_n = sta[:, : n + 1]
+                        _z_nxt = _step_predictor(_z, _a_n, _s_n)[:, -tokens_per_phys_step:]
                         _z = torch.cat([_z, _z_nxt], dim=1)
-                    z_ar = _z[:, tokens_per_frame:]
+                    z_ar = _z[:, tokens_per_phys_step:]
 
                     return z_tf, z_ar
 
                 def loss_fn(z, h):
-                    _h = h[:, tokens_per_frame : z.size(1) + tokens_per_frame]
+                    _h = h[:, tokens_per_phys_step : z.size(1) + tokens_per_phys_step]
                     return torch.mean(torch.abs(z - _h) ** loss_exp) / loss_exp
 
                 with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
