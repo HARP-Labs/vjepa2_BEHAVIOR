@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import os
+import random
 from logging import getLogger
 
 import numpy as np
@@ -109,11 +110,14 @@ class BehaviorMDSDataset(torch.utils.data.Dataset):
         sp0 = int(rows[0]["step_pos"])
         for t in range(1, T):
             if int(rows[t]["episode_idx"]) != ep0 or int(rows[t]["step_pos"]) != sp0 + t:
-                raise RuntimeError(
+                fallback_idx = random.randrange(len(self))
+                logger.warning(
                     f"Clip at row_start={row_start} is not contiguous within one episode "
                     f"(row {row_start+t}: episode_idx={rows[t]['episode_idx']}, "
-                    f"step_pos={rows[t]['step_pos']}, expected episode {ep0} step {sp0+t})."
+                    f"step_pos={rows[t]['step_pos']}, expected episode {ep0} step {sp0+t}). "
+                    f"Returning random clip at index {fallback_idx}."
                 )
+                return self[fallback_idx]
 
         # --- tokens: concatenate active camera views along token dim ---
         cam_token_list = []

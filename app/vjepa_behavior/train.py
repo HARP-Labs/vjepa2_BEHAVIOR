@@ -426,6 +426,11 @@ def main(args, resume_preempt=False):
                 else:
                     loss.backward()
 
+                torch.nn.utils.clip_grad_norm_(
+                    list(predictor.parameters()) + list(cam_embed.parameters()),
+                    max_norm=1.0,
+                )
+
                 if scaler is not None:
                     scaler.step(optimizer)
                     scaler.update()
