@@ -139,12 +139,17 @@ def init_opt(
     wd=1e-6,
     final_wd=1e-6,
     final_lr=0.0,
-    mixed_precision=False,
+    use_grad_scaler=False,
     betas=(0.9, 0.999),
     eps=1e-8,
     zero_init_bias_wd=True,
 ):
-    """AdamW + WSD LR schedule + cosine WD schedule for predictor + cam_embed."""
+    """AdamW + WSD LR schedule + cosine WD schedule for predictor + cam_embed.
+
+    use_grad_scaler should be True only for float16; bfloat16 does not need
+    gradient scaling (same exponent range as float32) and the scaler is a no-op
+    with non-trivial overhead.
+    """
     all_modules = [("predictor", predictor), ("cam_embed", cam_embed)]
 
     param_groups = []
@@ -182,5 +187,5 @@ def init_opt(
         final_wd=final_wd,
         T_max=int(num_epochs * iterations_per_epoch),
     )
-    scaler = torch.cuda.amp.GradScaler() if mixed_precision else None
+    scaler = torch.cuda.amp.GradScaler() if use_grad_scaler else None
     return optimizer, scaler, scheduler, wd_scheduler

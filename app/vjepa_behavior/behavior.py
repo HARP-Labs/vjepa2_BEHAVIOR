@@ -45,6 +45,10 @@ class BehaviorMDSDataset(torch.utils.data.Dataset):
         frames_per_clip,
         shuffle=False,
     ):
+        unknown = [c for c in cameras if c not in _CAMERA_KEYS]
+        if unknown:
+            raise ValueError(f"Unknown camera(s) {unknown}. Valid: {list(_CAMERA_KEYS)}")
+
         self.cameras = cameras
         self.frames_per_clip = frames_per_clip
         self.remote = remote

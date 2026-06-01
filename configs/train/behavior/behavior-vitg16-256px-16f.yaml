@@ -26,11 +26,9 @@ data:
   # ViT-G/16 at 256px: (256//16)^2 = 256
   tpf_per_cam: 256
 
-  # ViT-G encoder embed dimension
-  embed_dim: 1408
-
   # Frame stride used during the pre-encoding run (ceil(video_fps / target_fps))
-  # 30fps video at 5fps target → fstp=6; action chunk dim = fstp * 23 = 138
+  # 30fps video at 5fps target → fstp=6
+  # Must satisfy: model.action_embed_dim == action_fstp * 23  (validated at startup)
   action_fstp: 6
 
   batch_size: 32

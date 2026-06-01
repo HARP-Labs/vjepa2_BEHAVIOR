@@ -130,7 +130,9 @@ class VisionTransformerPredictorAC(nn.Module):
                 grid_width,
                 add_tokens=3 if use_extrinsics else 2,
             )
-        self.attn_mask = attn_mask
+        # Register as a non-persistent buffer so .to(device) moves it automatically
+        # and there is no CPU→GPU copy on every forward pass.
+        self.register_buffer('attn_mask', attn_mask, persistent=False)
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -171,7 +173,9 @@ class VisionTransformerPredictorAC(nn.Module):
             x = torch.cat([a, s, x], dim=2).flatten(1, 2)  # [B, T*(cam*H*W+2), D]
 
         cond_tokens = 3 if self.use_extrinsics else 2
-        attn_mask = self.attn_mask[: x.size(1), : x.size(1)].to(x.device, non_blocking=True)
+        attn_mask = None
+        if self.attn_mask is not None:
+            attn_mask = self.attn_mask[: x.size(1), : x.size(1)]
 
         # Fwd prop
         for i, blk in enumerate(self.predictor_blocks):

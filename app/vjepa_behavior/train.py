@@ -71,6 +71,8 @@ def main(args, resume_preempt=False):
     else:
         dtype = torch.float32
         mixed_precision = False
+    # bfloat16 has float32-range exponents and never needs gradient scaling.
+    use_grad_scaler = dtype == torch.float16
 
     # -- MODEL
     cfgs_model = args.get("model")
@@ -102,9 +104,17 @@ def main(args, resume_preempt=False):
     pin_mem = cfgs_data.get("pin_mem", True)
     persistent_workers = cfgs_data.get("persistent_workers", True)
 
+    action_fstp = cfgs_data.get("action_fstp", None)
+
     assert len(cameras) == n_cameras, (
         f"data.cameras={cameras} (len={len(cameras)}) must match model.n_cameras={n_cameras}"
     )
+
+    if action_fstp is not None:
+        assert action_embed_dim == action_fstp * 23, (
+            f"model.action_embed_dim={action_embed_dim} != data.action_fstp * 23 = {action_fstp * 23}. "
+            f"Update model.action_embed_dim when changing data.action_fstp."
+        )
 
     patch_grid = int(tpf_per_cam ** 0.5)
     assert patch_grid * patch_grid == tpf_per_cam, (
@@ -157,8 +167,14 @@ def main(args, resume_preempt=False):
     # -- log/checkpointing paths
     log_file = os.path.join(folder, f"log_r{rank}.csv")
     latest_path = os.path.join(folder, "latest.pt")
-    resume_path = os.path.join(folder, r_file) if r_file is not None else latest_path
-    if not os.path.exists(resume_path):
+    if r_file is not None:
+        resume_path = os.path.join(folder, r_file)
+        if not os.path.exists(resume_path):
+            logger.warning(f"Requested resume_checkpoint not found: {resume_path}")
+            resume_path = None
+    elif os.path.exists(latest_path):
+        resume_path = latest_path
+    else:
         resume_path = None
 
     csv_logger = CSVLogger(
@@ -232,7 +248,7 @@ def main(args, resume_preempt=False):
         anneal=anneal,
         warmup=warmup,
         num_epochs=num_epochs,
-        mixed_precision=mixed_precision,
+        use_grad_scaler=use_grad_scaler,
         betas=betas,
         eps=eps,
     )
@@ -241,7 +257,7 @@ def main(args, resume_preempt=False):
     cam_embed = DistributedDataParallel(cam_embed, static_graph=True)
 
     start_epoch = 0
-    if resume_path is not None and os.path.exists(resume_path):
+    if resume_path is not None:
         predictor, cam_embed, optimizer, scaler, start_epoch = load_checkpoint(
             r_path=resume_path,
             predictor=predictor,
@@ -404,13 +420,13 @@ def main(args, resume_preempt=False):
                     sloss = loss_fn(z_ar, h.detach())
                     loss = jloss + sloss
 
-                if mixed_precision:
+                if scaler is not None:
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
                 else:
                     loss.backward()
 
-                if mixed_precision:
+                if scaler is not None:
                     scaler.step(optimizer)
                     scaler.update()
                 else:
