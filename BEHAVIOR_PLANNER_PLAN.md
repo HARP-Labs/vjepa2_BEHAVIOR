@@ -444,6 +444,53 @@ These are stubs/configs that need user input before end-to-end runs:
 
 ---
 
+## Open Discussion — State Representation for Training
+
+Training has not started. The choice of state representation is still open and affects both the predictor architecture (`state_embed_dim`) and the analytical integration strategy at planning time.
+
+### Context
+
+DROID's state is 7-dim Cartesian EEF pose + gripper. Its actions are computed as `poses_to_diffs(states)` — pose deltas — so `state_{t+1} = state_t ⊕ action_t` (SE(3) composition). State is always exactly known from the action sequence; no environment queries needed. This is why DROID never had a state prediction problem.
+
+BEHAVIOR's current state is 133-dim proprioceptive (joint angles stored three ways: raw + sin + cos, plus joint velocities, EEF poses, IMU). Actions are 23-dim joint velocity commands, not Cartesian deltas — so DROID's direct trick doesn't apply. However, the MDS dataset already stores `cam_rel_poses` (21-dim: 3 cameras × pos(3)+quat(4) relative to robot base), which is effectively the EEF Cartesian state in camera space.
+
+At planning time, the inner rollout loop (64 samples × 5 steps) must propagate state forward without environment queries. The chosen representation determines whether this is exact or approximate.
+
+### Four Options
+
+| Option | State dim | Training change | Planning integration | Velocity signal |
+|---|---|---|---|---|
+| A — 133-dim as-is | 133 | none | `q_t = q_0 + Σ a*dt`, recompute all 133 dims via FK + trig | from joint_qvel in state |
+| B — cam_rel_poses + gripper | 23 | swap state source | `cam_t = FK(q_t)`, gripper from action cumsum | none |
+| C — DROID-style Cartesian delta | 14 (2×7 EEF) | redefine action space | `state_{t+1} = state_t ⊕ action_t` | none |
+| D — cam_rel_poses + gripper + EEF velocity | 29 | swap state source | `cam_t = FK(q_t)`, vel = `J(q_t) * a_t` | yes, via Jacobian |
+
+**Option C is ruled out**: BEHAVIOR is bimanual with trunk and base. A single Cartesian pose delta is ambiguous — converting 23 joint-velocity DOFs to Cartesian loses the coupling and doesn't generalise. DROID's trick works because it is a single 7-DOF arm.
+
+**Preferred direction: Option D** (or B as a simpler fallback).
+
+Rationale: the predictor's task is to predict visual tokens. The most relevant conditioning is (1) where the cameras are in 3D space — `cam_rel_poses` — which directly determines the geometric structure of the tokens, and (2) how fast they are moving — EEF velocity via Jacobian. Everything else in the 133-dim vector is either redundant (qpos represented three times) or tangential to vision.
+
+At planning time this reduces to pure math — no simulator, no environment query, no learned state head, exact for free-space motion:
+
+```python
+q_t = q_0 + cumsum(actions[:, :t, :22], dim=1) * dt   # [B, 22]
+cam_t    = fk(q_t)                                      # [B, 21]
+eef_vel  = jacobian(q_t) @ actions[:, t, :22]           # [B, 6]  (Option D only)
+gripper  = gripper_0 + cumsum(actions[:, :t, 20:22]) * dt
+state_t  = cat([cam_t, gripper, eef_vel], dim=-1)       # [B, 23 or 29]
+```
+
+For real-world R1 Pro deployment, `q_0` comes directly from joint encoders — nothing else changes.
+
+### Decision needed before training starts
+
+- Which option to use (A / B / D)?
+- If B or D: confirm that `cam_rel_poses` in the MDS is computed from the same FK as will be used at planning time (i.e. same URDF / coordinate convention).
+- If D: decide whether to compute the Jacobian offline (during MDS dataset build) or online at training time.
+
+---
+
 ## Verification
 
 ### Unit tests
